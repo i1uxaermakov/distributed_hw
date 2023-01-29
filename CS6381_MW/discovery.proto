@@ -95,9 +95,7 @@ message LookupPubByTopicReq
 // accordingly there will be a response to the above message
 message LookupPubByTopicResp
 {
-     // TO-DO
-     // decide what fields go here. It wil be a list of publishers (with their details)
-    // Maybe the RegistrantInfo message can be reused.
+    repeated string addressesToConnectTo = 1;
 }
 
 // Finally, we are going to make a union of all these request and response messages

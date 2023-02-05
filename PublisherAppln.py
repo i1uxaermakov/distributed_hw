@@ -424,6 +424,10 @@ def main ():
 
   except Exception as e:
     logger.error ("Exception caught in main - {}".format (e))
+    type, value, traceback = sys.exc_info()
+    logger.error ("Type: %s", type)
+    logger.error ("Value: %s", value)
+    logger.error ("Traceback: %s", traceback.format_exc())
     return
 
     

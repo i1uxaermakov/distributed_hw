@@ -200,7 +200,7 @@ class DiscoveryAppln ():
           
           # for each topic the publisher is publishing on, make a note that there is a new publisher in the topic_to_publishers_id_mapping
           for topic in topiclist:
-            self.topic_to_publishers_id_mapping.setdefault(topic, []).append(ip_port_pair)
+            self.topic_to_publishers_id_mapping.setdefault(topic, []).append(registrant_id)
           
           # respond to the service that made the request
           self.mw_obj.respond_to_register_request(True)
@@ -273,13 +273,15 @@ class DiscoveryAppln ():
       socketsToConnectTo = set()
       
       # if disseminating through broker, we are returning the ip:port of a broker, no matter what the subscriber is interested in
-      if(self.dissemination == 'Broker'):
+      if(self.dissemination == 'Broker' and not all):
+        self.logger.info ("DiscoveryAppln::handle_lookup_pub_by_topics – disseminating through broker, returning broker's address")
         brokerId = next(iter(self.registered_brokers))
         broker_ip_port = self.broker_id_to_ipport_mapping[brokerId]
         socketsToConnectTo.add(broker_ip_port)
       
       # if disseminating directly, return ip:port of publishers that publish on those topics
       else:
+        self.logger.info ("DiscoveryAppln::handle_lookup_pub_by_topics – disseminating through direct approach, finding subscribers to talk to")
         if(all):
           # if interested in all topics (in case of broker's lookup request), then go over all publishers and add their ip:port
           for publisher_ip_port in self.publisher_id_to_ipport_mapping.values():
@@ -290,10 +292,11 @@ class DiscoveryAppln ():
             for pub_id in self.topic_to_publishers_id_mapping[topic]:
               socketsToConnectTo.add(self.publisher_id_to_ipport_mapping[pub_id])
 
+        self.logger.info ("DiscoveryAppln::handle_lookup_pub_by_topics – for topics %s the subscriber will need to connect to the following publishers %s", str(lookup_req.topiclist), str(socketsToConnectTo))
+
       # socketsToConnectTo set now contains all sockets the subscriber needs to connect to
       # Send them to the requester
       self.mw_obj.respond_to_lookup_request(socketsToConnectTo)
-      
       
       return None
 
@@ -378,6 +381,10 @@ def main ():
 
   except Exception as e:
     logger.error ("Exception caught in main - {}".format (e))
+    type, value, traceback = sys.exc_info()
+    logger.error ("Type: %s", type)
+    logger.error ("Value: %s", value)
+    logger.error ("Traceback: %s", traceback.format_exc())
     return
 
 

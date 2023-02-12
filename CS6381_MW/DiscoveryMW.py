@@ -153,6 +153,11 @@ class DiscoveryMW ():
         self.logger.info ("DiscoveryMW::handle_request – sending the LOOKUP PUBLISHERS BY TOPICS request to be handled in the upcall object")
         timeout = self.upcall_obj.handle_lookup_pub_by_topics(disc_req.lookup_req)
 
+      elif (disc_req.msg_type == discovery_pb2.TYPE_LOOKUP_ALL_PUBS):
+        # received a lookup request
+        self.logger.info ("DiscoveryMW::handle_request – sending the LOOKUP ALL PUBLISHERS request to be handled in the upcall object")
+        timeout = self.upcall_obj.handle_lookup_pub_by_topics(disc_req.lookup_req, True)
+
       else: # anything else is unrecognizable by this object
         # raise an exception here
         raise ValueError ("Unrecognized response message")

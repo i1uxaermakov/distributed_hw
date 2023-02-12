@@ -90,9 +90,7 @@ message LookupPubByTopicReq
     repeated string topiclist = 1; // modify this appropriately
 }
 
-// TO-DO
-// Have a corresponding response to the lookupPubByTopic request
-// accordingly there will be a response to the above message
+// Corresponding response to the lookupPubByTopic request
 message LookupPubByTopicResp
 {
     repeated string addressesToConnectTo = 1;

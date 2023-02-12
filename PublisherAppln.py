@@ -190,7 +190,7 @@ class PublisherAppln ():
     ''' Invoke operating depending on state  '''
 
     try:
-      self.logger.info ("PublisherAppln::invoke_operation")
+      self.logger.info ("PublisherAppln::invoke_operation – Current State is %s", str(self.state))
 
       # check what state are we in. If we are in REGISTER state,
       # we send register request to discovery service. If we are in
@@ -244,6 +244,7 @@ class PublisherAppln ():
             # protobuf.  In fact, I am going to do this once my basic logic is working.
             dissemination_data = ts.gen_publication (topic)
             self.mw_obj.disseminate (self.name, topic, dissemination_data)
+            self.logger.info ("Sent to topic: %s, data: %s", topic, dissemination_data)
 
           # Now sleep for an interval of time to ensure we disseminate at the
           # frequency that was configured.
@@ -319,6 +320,7 @@ class PublisherAppln ():
         # discovery service is not ready yet
         self.logger.debug ("PublisherAppln::driver - Not ready yet; check again")
         time.sleep (10)  # sleep between calls so that we don't make excessive calls
+        # return 5 * 1000 # timeout of this many seconds
 
       else:
         # we got the go ahead
@@ -383,7 +385,7 @@ def parseCmdLineArgs ():
 
   parser.add_argument ("-f", "--frequency", type=int,default=1, help="Rate at which topics disseminated: default once a second - use integers")
 
-  parser.add_argument ("-i", "--iters", type=int, default=1000, help="number of publication iterations (default: 1000)")
+  parser.add_argument ("-i", "--iters", type=int, default=20, help="number of publication iterations (default: 20)")
 
   parser.add_argument ("-l", "--loglevel", type=int, default=logging.INFO, choices=[logging.DEBUG,logging.INFO,logging.WARNING,logging.ERROR,logging.CRITICAL], help="logging level, choices 10,20,30,40,50: default 20=logging.INFO")
   

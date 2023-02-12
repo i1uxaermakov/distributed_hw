@@ -252,6 +252,8 @@ class DiscoveryAppln ():
 
     areBrokersReady = (self.dissemination != 'Broker' or (self.dissemination == 'Broker' and len(self.registered_brokers) != 0))
 
+    self.logger.info("areBrokersReady = %s", str(areBrokersReady))
+
     isSystemReady = areSubscribersReady and arePublishersReady and areBrokersReady
 
     # send the response with the result
@@ -289,14 +291,15 @@ class DiscoveryAppln ():
         else:
           # If interested in select number of topics, go over topics and add corresponding publishers to the set of publishers to connect to
           for topic in lookup_req.topiclist:
-            for pub_id in self.topic_to_publishers_id_mapping[topic]:
+
+            for pub_id in self.topic_to_publishers_id_mapping.get(topic):
               socketsToConnectTo.add(self.publisher_id_to_ipport_mapping[pub_id])
 
         self.logger.info ("DiscoveryAppln::handle_lookup_pub_by_topics – for topics %s the subscriber will need to connect to the following publishers %s", str(lookup_req.topiclist), str(socketsToConnectTo))
 
       # socketsToConnectTo set now contains all sockets the subscriber needs to connect to
       # Send them to the requester
-      self.mw_obj.respond_to_lookup_request(socketsToConnectTo)
+      self.mw_obj.respond_to_lookup_request(socketsToConnectTo, all)
       
       return None
 

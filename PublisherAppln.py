@@ -92,6 +92,7 @@ class PublisherAppln ():
     self.dissemination = None # direct or via broker
     self.mw_obj = None # handle to the underlying Middleware object
     self.logger = logger  # internal logger for print statements
+    self.experiment_name = None
 
   ########################################
   # configure/initialize
@@ -111,6 +112,7 @@ class PublisherAppln ():
       self.iters = args.iters  # num of iterations
       self.frequency = args.frequency # frequency with which topics are disseminated
       self.num_topics = args.num_topics  # total num of topics we publish
+      self.experiment_name = args.experiment_name
 
       # Now, get the configuration object
       self.logger.debug ("PublisherAppln::configure - parsing config.ini")
@@ -242,7 +244,15 @@ class PublisherAppln ():
             # For now, we have chosen to send info in the form "topic name: topic value"
             # In later assignments, we should be using more complex encodings using
             # protobuf.  In fact, I am going to do this once my basic logic is working.
-            dissemination_data = ts.gen_publication (topic)
+            data_for_topic = ts.gen_publication (topic)
+
+            dissemination_data = str({
+              "topic":topic, 
+              "data":data_for_topic,
+              "pubid":self.name,
+              "sent_timestamp":str(time.time()),
+              "exp_name": self.experiment_name
+              })
             self.mw_obj.disseminate (self.name, topic, dissemination_data)
             self.logger.info ("Sent to topic: %s, data: %s", topic, dissemination_data)
 
@@ -385,9 +395,11 @@ def parseCmdLineArgs ():
 
   parser.add_argument ("-f", "--frequency", type=int,default=1, help="Rate at which topics disseminated: default once a second - use integers")
 
-  parser.add_argument ("-i", "--iters", type=int, default=20, help="number of publication iterations (default: 20)")
+  parser.add_argument ("-i", "--iters", type=int, default=10, help="number of publication iterations (default: 20)")
 
   parser.add_argument ("-l", "--loglevel", type=int, default=logging.INFO, choices=[logging.DEBUG,logging.INFO,logging.WARNING,logging.ERROR,logging.CRITICAL], help="logging level, choices 10,20,30,40,50: default 20=logging.INFO")
+
+  parser.add_argument("-en", "--experiment_name", default="exp", help="name of the experiment we are running, will be included in the payload sent to the subscribers")
   
   return parser.parse_args()
 

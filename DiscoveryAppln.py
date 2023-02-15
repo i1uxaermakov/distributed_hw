@@ -78,6 +78,7 @@ class DiscoveryAppln ():
     self.logger = logger  # internal logger for print statements
     self.expected_pub_num = 0    # number of publishers in the system
     self.expected_sub_num = 0    # number of subscribers in the system
+    self.timeout = None
 
     self.registered_publishers = set() # set of strings, where each string is id of a publisher
     self.publisher_id_to_ipport_mapping = {}
@@ -107,6 +108,7 @@ class DiscoveryAppln ():
       config.read (args.config)
       self.lookup = config["Discovery"]["Strategy"]
       self.dissemination = config["Dissemination"]["Strategy"]
+      self.timeout = args.timeout * 1000 # timeout for receiving data when subscribed in ms
 
       self.expected_pub_num = args.publishers    # number of publishers in the system
       self.expected_sub_num = args.subscribers    # number of subscribers in the system
@@ -159,7 +161,7 @@ class DiscoveryAppln ():
       # None or some large value, but if we want to send a request ourselves right away,
       # we set timeout is zero.
       #
-      self.mw_obj.event_loop (timeout=None)  # start the event loop
+      self.mw_obj.event_loop (timeout=self.timeout)  # start the event loop
       
       self.logger.info ("DiscoveryAppln::driver completed")
       
@@ -301,10 +303,17 @@ class DiscoveryAppln ():
       # Send them to the requester
       self.mw_obj.respond_to_lookup_request(socketsToConnectTo, all)
       
-      return None
+      return self.timeout
 
     except Exception as e:
       raise e
+
+
+  def stop_appln(self):
+    self.logger.info ("PublisherAppln::stop_appln - Stopping the application completed")
+    self.mw_obj.disable_event_loop ()
+    return None
+
 
 
   ########################################
@@ -345,6 +354,8 @@ def parseCmdLineArgs ():
   parser.add_argument ("-c", "--config", default="config.ini", help="configuration file (default: config.ini)")
 
   parser.add_argument ("-l", "--loglevel", type=int, default=logging.INFO, choices=[logging.DEBUG,logging.INFO,logging.WARNING,logging.ERROR,logging.CRITICAL], help="logging level, choices 10,20,30,40,50: default 20=logging.INFO")
+
+  parser.add_argument ("-t", "--timeout", type=int, default=30, help="Timeout for receiving requests. If we do not receive requests for this many seconds, we assume publishers/subscribers no longer need discovery service, so we stop the application")
   
   return parser.parse_args()
 

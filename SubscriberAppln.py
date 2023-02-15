@@ -34,6 +34,8 @@ import time   # for sleep
 import argparse # for argument parsing
 import configparser # for configuration parsing
 import logging # for logging. Use it in place of print statements.
+import ast # for working with subsrption data (converting it back to dictionary)
+import mysql.connector # for working with mysql for analytics
 
 # Import our topic selector. Feel free to use alternate way to
 # get your topics of interest
@@ -76,6 +78,10 @@ class SubscriberAppln ():
     self.mw_obj = None # handle to the underlying Middleware object
     self.logger = logger  # internal logger for print statements
     self.timeout = None
+    self.pub_num = None
+    self.sub_num = None
+    self.freq = None
+    self.latency_data = []
 
   ########################################
   # configure/initialize
@@ -94,6 +100,9 @@ class SubscriberAppln ():
       self.name = args.name # our name
       self.num_topics = args.num_topics  # total num of topics we publish
       self.timeout = args.timeout * 1000 # timeout for receiving data when subscribed in ms
+      self.pub_num = args.publishers
+      self.sub_num = args.subscribers
+      self.freq = args.frequency
 
       # Now, get the configuration object
       self.logger.debug ("SubscriberAppln::configure - parsing config.ini")
@@ -234,6 +243,10 @@ class SubscriberAppln ():
         # we are done. Time to break the event loop. So we created this special method on the
         # middleware object to kill its event loop
         self.mw_obj.disable_event_loop ()
+
+        # Send data to database
+        self.send_latency_data_to_db()
+
         return None
 
       else:
@@ -243,6 +256,38 @@ class SubscriberAppln ():
     except Exception as e:
       raise e
 
+
+  ########################################
+  # Sending collected data about 
+  # latencies for further analysis 
+  # into mysql database on aws
+  ########################################
+  def send_latency_data_to_db(self):
+    try:
+      connection = mysql.connector.connect(host='34.227.58.170',
+                                          database='distributed_hw1',
+                                          user='root',
+                                          password='Password2023!')
+
+      mySql_insert_query = """INSERT INTO latencies(latency_sec, frequency, num_topics, pub_num, sub_num, dissemination, pub_id, sub_id, experiment_name) 
+      VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)"""
+
+      cursor = connection.cursor()
+      cursor.executemany(mySql_insert_query, self.latency_data)
+      connection.commit()
+
+      self.logger.info ("SubscriberAppln::send_latency_data_to_db - {} records inserted successfully into Latencies table".format(cursor.rowcount))
+      cursor.close()
+
+    except mysql.connector.Error as error:
+      self.logger.error ("SubscriberAppln::send_latency_data_to_db - Failed to insert records into Latencies table: {}".format(error))
+
+    finally:
+      if connection.is_connected():
+          connection.close()
+          self.logger.info("SubscriberAppln::send_latency_data_to_db - MySQL connection is closed")
+
+    return
 
   ########################################
   # handle register response method called as part of upcall
@@ -341,10 +386,30 @@ class SubscriberAppln ():
       self.logger.info ("SubscriberAppln::handle_receipt_of_subscription_data")
 
       self.logger.info("RECEIVED DATA: %s", string_received)
+      beginning_of_payload = (string_received.find(':') + 1)
+      string_received = string_received[beginning_of_payload:]
+
+      # save latency information locally so that it can be sent to the database later
+      data = ast.literal_eval(string_received)
+      cur_timestamp = time.time()
+      sent_timestamp = float(data['sent_timestamp'])
+      latency = str(cur_timestamp - sent_timestamp)
+
+      # INSERT INTO latencies(latency_sec, frequency, num_topics, pub_num, sub_num, pub_id, sub_id, experiment_name) VALUES ();
+      self.latency_data.append((
+        latency, 
+        self.freq, 
+        self.num_topics, 
+        self.pub_num,
+        self.sub_num,
+        self.dissemination,
+        data['pubid'], 
+        self.name, 
+        data['exp_name']))
       
       # return standard timeout for subscription data
-      # if we do not receive data for this many milliseconds, we finish application # TODO
-      return 20*1000
+      # if we do not receive data for this many milliseconds, we finish application
+      return self.timeout
     
     except Exception as e:
       raise e
@@ -394,6 +459,13 @@ def parseCmdLineArgs ():
   parser.add_argument ("-l", "--loglevel", type=int, default=logging.INFO, choices=[logging.DEBUG,logging.INFO,logging.WARNING,logging.ERROR,logging.CRITICAL], help="logging level, choices 10,20,30,40,50: default 20=logging.INFO")
 
   parser.add_argument ("-t", "--timeout", type=int, default=20, help="Timeout for receiving subscription data. If we do not receive data for this many seconds, we assume publishers are done publishing data and we stop the application")
+
+  # number of publishers and, frequency are added because we want to send that data to the database
+  parser.add_argument("-P", "--publishers", type=int, default=2, help="Number of publishers")
+
+  parser.add_argument("-S", "--subscribers", type=int, default=2, help="Number of subscribers")
+
+  parser.add_argument ("-f", "--frequency", type=int,default=1, help="Rate at which topics disseminated: default once a second - use integers")
   
   return parser.parse_args()
 

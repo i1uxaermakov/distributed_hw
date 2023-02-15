@@ -98,8 +98,8 @@ class DiscoveryMW ():
         # check if a timeout has occurred. We know this is the case when
         # the event mask is empty
         if not events:
-          # do nothing because we do not have a timeout for Discovery Service
-          continue
+          # we are ready to shut down because everybody has already registered
+          timeout = self.upcall_obj.stop_appln()
           
         elif self.rep in events:  # this is the only socket on which we should be receiving replies
 

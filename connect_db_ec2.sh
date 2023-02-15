@@ -1,0 +1,1 @@
+ssh -i acc-key.pem ubuntu@34.227.58.170

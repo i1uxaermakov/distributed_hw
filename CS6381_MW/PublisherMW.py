@@ -29,6 +29,8 @@ import sys    # for syspath and system exception
 import time   # for sleep
 import logging # for logging. Use it in place of print statements.
 import zmq  # ZMQ sockets
+import json # for reading the dht.json file
+import random # for choosing a random DHT node to contact
 
 # import serialization logic
 from CS6381_MW import discovery_pb2
@@ -53,6 +55,8 @@ class PublisherMW ():
     self.port = None # port num where we are going to publish our topics
     self.upcall_obj = None # handle to appln obj to handle appln-specific data
     self.handle_events = True # in general we keep going thru the event loop
+    self.dht_json_path = None
+    self.dht_num = None
 
   ########################################
   # configure/initialize
@@ -67,6 +71,9 @@ class PublisherMW ():
       # First retrieve our advertised IP addr and the publication port num
       self.port = args.port
       self.addr = args.addr
+
+      # path to the DHT.json file
+      self.dht_json_path = args.dht_json_path
       
       # Next get the ZMQ context
       self.logger.debug ("PublisherMW::configure - obtain ZMQ context")
@@ -92,10 +99,22 @@ class PublisherMW ():
       # Now connect ourselves to the discovery service. Recall that the IP/port were
       # supplied in our argument parsing. Best practices of ZQM suggest that the
       # one who maintains the REQ socket should do the "connect"
-      self.logger.debug ("PublisherMW::configure - connect to Discovery service")
-      # For our assignments we will use TCP. The connect string is made up of
-      # tcp:// followed by IP addr:port number.
-      connect_str = "tcp://" + args.discovery
+      self.logger.info ("PublisherMW::configure - connect to Discovery service")
+      
+      # if we are using DHT lookup, we are connecting to a random node in DHT file
+      # otherwise, we are connecting to the discovery service specified in the parameters
+      if (self.upcall_obj.lookup == "DHT"):
+        f = open(self.dht_json_path)
+        dht_file = json.load(f) # get dht.hson as a dictionary
+        dht_nodes_number = len(dht_file['dht'])
+        self.dht_num = dht_nodes_number
+        random_index = random.randint(0, dht_nodes_number-1)
+        randomly_chosen_dht = dht_file['dht'][random_index]
+        self.logger.info (f"PublisherMW::configure - connect to DHT Discovery service: {randomly_chosen_dht}")
+        connect_str = "tcp://" + randomly_chosen_dht['IP'] + ":" + str(randomly_chosen_dht['port'])
+      else:
+        connect_str = "tcp://" + args.discovery
+      
       self.req.connect (connect_str)
       
       # Since we are the publisher, the best practice as suggested in ZMQ is for us to
@@ -180,10 +199,10 @@ class PublisherMW ():
       # in the next iteration of the poll.
       if (disc_resp.msg_type == discovery_pb2.TYPE_REGISTER):
         # let the appln level object decide what to do
-        timeout = self.upcall_obj.register_response (disc_resp.register_resp)
+        timeout = self.upcall_obj.register_response (disc_resp.register_resp, disc_resp.timestamp_sent)
       elif (disc_resp.msg_type == discovery_pb2.TYPE_ISREADY):
         # this is a response to is ready request
-        timeout = self.upcall_obj.isready_response (disc_resp.isready_resp)
+        timeout = self.upcall_obj.isready_response (disc_resp.isready_resp, disc_resp.timestamp_sent)
 
       else: # anything else is unrecognizable by this object
         # raise an exception here
@@ -241,6 +260,7 @@ class PublisherMW ():
       # It was observed that we cannot directly assign the nested field here.
       # A way around is to use the CopyFrom method as shown
       disc_req.register_req.CopyFrom (register_req)
+      disc_req.timestamp_sent = str(time.time())
       self.logger.debug ("PublisherMW::register - done building the outer message")
       
       # now let us stringify the buffer and print it. This is actually a sequence of bytes and not
@@ -266,7 +286,7 @@ class PublisherMW ():
   # No return value from this as it is handled in the invoke_operation
   # method of the application object.
   ########################################
-  def is_ready (self):
+  def is_ready (self, imready_timestamp):
     ''' register the appln with the discovery service '''
 
     try:
@@ -291,6 +311,7 @@ class PublisherMW ():
       # It was observed that we cannot directly assign the nested field here.
       # A way around is to use the CopyFrom method as shown
       disc_req.isready_req.CopyFrom (isready_req)
+      disc_req.timestamp_sent = imready_timestamp
       self.logger.debug ("PublisherMW::is_ready - done building the outer message")
       
       # now let us stringify the buffer and print it. This is actually a sequence of bytes and not

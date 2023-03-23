@@ -26,6 +26,8 @@ import sys    # for syspath and system exception
 import time   # for sleep
 import logging # for logging. Use it in place of print statements.
 import zmq  # ZMQ sockets
+import json # for reading the dht.json file
+import random # for choosing a random DHT node to contact
 
 # import serialization logic
 from CS6381_MW import discovery_pb2
@@ -67,6 +69,9 @@ class BrokerMW ():
       self.port = args.port
       self.addr = args.addr
       self.timeout = args.timeout * 1000 # timeout for receiving data when subscribed in ms
+
+      # path to the DHT.json file
+      self.dht_json_path = args.dht_json_path
       
       # Next get the ZMQ context
       self.logger.debug ("BrokerMW::configure - obtain ZMQ context")
@@ -94,9 +99,21 @@ class BrokerMW ():
       # supplied in our argument parsing. Best practices of ZQM suggest that the
       # one who maintains the REQ socket should do the "connect"
       self.logger.debug ("BrokerMW::configure - connect to Discovery service")
-      # For our assignments we will use TCP. The connect string is made up of
-      # tcp:// followed by IP addr:port number.
-      connect_str = "tcp://" + args.discovery
+
+      # if we are using DHT lookup, we are connecting to a random node in DHT file
+      # otherwise, we are connecting to the discovery service specified in the parameters
+      if (self.upcall_obj.lookup == "DHT"):
+        f = open(self.dht_json_path)
+        dht_file = json.load(f) # get dht.hson as a dictionary
+        dht_nodes_number = len(dht_file['dht'])
+        self.dht_num = dht_nodes_number
+        random_index = random.randint(0, dht_nodes_number-1)
+        randomly_chosen_dht = dht_file['dht'][random_index]
+        self.logger.info (f"PublisherMW::configure - connect to DHT Discovery service: {randomly_chosen_dht}")
+        connect_str = "tcp://" + randomly_chosen_dht['IP'] + ":" + str(randomly_chosen_dht['port'])
+      else:
+        connect_str = "tcp://" + args.discovery
+
       self.req.connect (connect_str)
       
       # Since we are the Broker, we "bind" the PUB socket

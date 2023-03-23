@@ -82,6 +82,10 @@ class SubscriberAppln ():
     self.sub_num = None
     self.freq = None
     self.latency_data = []
+    self.imready_timestamp = "" # for is ready statistics
+    self.register_latency_statistics = []
+    self.isready_latency_statistics = []
+    self.lookup_latency_statistics = []
 
   ########################################
   # configure/initialize
@@ -120,7 +124,16 @@ class SubscriberAppln ():
       # everything
       self.logger.debug ("SubscriberAppln::configure - initialize the middleware object")
       self.mw_obj = SubscriberMW (self.logger)
-      self.mw_obj.configure (args) # pass remainder of the args to the m/w object
+
+      # First ask our middleware to keep a handle to us to make upcalls.
+      # This is related to upcalls. By passing a pointer to ourselves, the
+      # middleware will keep track of it and any time something must
+      # be handled by the application level, invoke an upcall.
+      self.logger.debug ("SubscriberAppln::driver - upcall handle")
+      self.mw_obj.set_upcall_handle (self)
+
+      # pass remainder of the args to the m/w object
+      self.mw_obj.configure (args) 
       
       self.logger.info ("SubscriberAppln::configure - configuration complete")
       
@@ -139,13 +152,6 @@ class SubscriberAppln ():
 
       # dump our contents (debugging purposes)
       self.dump ()
-
-      # First ask our middleware to keep a handle to us to make upcalls.
-      # This is related to upcalls. By passing a pointer to ourselves, the
-      # middleware will keep track of it and any time something must
-      # be handled by the application level, invoke an upcall.
-      self.logger.debug ("SubscriberAppln::driver - upcall handle")
-      self.mw_obj.set_upcall_handle (self)
 
       # the next thing we should be doing is to register with the discovery
       # service. But because we are simply delegating everything to an event loop
@@ -210,7 +216,7 @@ class SubscriberAppln ():
         # and the upcall until we receive the go ahead from the discovery service.
         
         self.logger.debug ("SubscriberAppln::invoke_operation - check if are ready to go")
-        self.mw_obj.send_isready_request ()  # send the is_ready? request
+        self.mw_obj.send_isready_request (self.imready_timestamp)  # send the is_ready? request
 
         # Remember that we were invoked by the event loop as part of the upcall.
         # So we are going to return back to it for its next iteration. Because
@@ -245,7 +251,7 @@ class SubscriberAppln ():
         self.mw_obj.disable_event_loop ()
 
         # Send data to database
-        self.send_latency_data_to_db()
+        # self.send_latency_data_to_db()
 
         return None
 
@@ -297,7 +303,7 @@ class SubscriberAppln ():
   # of the message and what should be done. So it becomes the job
   # of the application. Hence this upcall is made to us.
   ########################################
-  def handle_register_response (self, reg_resp):
+  def handle_register_response (self, reg_resp, timestamp_sent):
     ''' handle register response '''
 
     try:
@@ -307,6 +313,21 @@ class SubscriberAppln ():
 
         # set our next state to isready so that we can then send the isready message right away
         self.state = self.State.ISREADY
+        self.imready_timestamp = str(time.time())
+
+        # Save statistics about register latency
+        cur_timestamp = time.time()
+        sent_timestamp = float(timestamp_sent)
+        register_latency = str(cur_timestamp - sent_timestamp)
+        self.register_latency_statistics.append((
+          "REGISTER",
+          register_latency,
+          self.lookup, # lookup strategy
+          self.pub_num, # num of publishers
+          self.sub_num, # num of subscribers
+          self.mw_obj.dht_num, # num of dht nodes
+          self.name, # id of sub
+        ))
         
         # return a timeout of zero so that the event loop in its next iteration will immediately make
         # an upcall to us
@@ -324,7 +345,7 @@ class SubscriberAppln ():
   #
   # Also a part of upcall handled by application logic
   ########################################
-  def handle_isready_response (self, isready_resp):
+  def handle_isready_response (self, isready_resp, timestamp_sent):
     ''' handle isready response '''
 
     try:
@@ -335,13 +356,29 @@ class SubscriberAppln ():
       # upcall methods.
       if not isready_resp.status:
         # discovery service is not ready yet
-        self.logger.debug ("SubscriberAppln::handle_isready_response - Not ready yet; check again")
-        time.sleep (10)  # sleep between calls so that we don't make excessive calls
+        self.logger.info ("SubscriberAppln::handle_isready_response - Not ready yet; check again")
+
+        # Disabling sleeping to check is ready latency
+        # time.sleep (5)  # sleep between calls so that we don't make excessive calls
 
       else:
         # we got the go ahead
         # we now look up publishers to connect to
         self.state = self.State.LOOKUP_PUBLISHERS
+
+        # Save statistics about is_ready latency
+        cur_timestamp = time.time()
+        sent_timestamp = float(timestamp_sent)
+        isready_latency = str(cur_timestamp - sent_timestamp)
+        self.isready_latency_statistics.append((
+          "ISREADY",
+          isready_latency,
+          self.lookup, # lookup strategy
+          self.pub_num, # num of publishers
+          self.sub_num, # num of subscribers
+          self.mw_obj.dht_num, # num of dht nodes
+          self.name, # id of subscriber
+          ))
         
       # return timeout of 0 so event loop calls us back in the invoke_operation
       # method, where we take action based on what state we are in.
@@ -352,15 +389,32 @@ class SubscriberAppln ():
 
 
   ########################################
-  # handle isready response method called as part of upcall
+  # handle_lookup_response response method called as part of upcall
   #
   # Also a part of upcall handled by application logic
   ########################################
-  def handle_lookup_response (self, lookup_resp):
+  def handle_lookup_response (self, lookup_resp, timestamp_sent):
     ''' handle_lookup_response '''
 
     try:
       self.logger.info ("SubscriberAppln::handle_lookup_response")
+
+      # Save statistics about lookup latency
+      cur_timestamp = time.time()
+      sent_timestamp = float(timestamp_sent)
+      lookup_latency = str(cur_timestamp - sent_timestamp)
+      self.lookup_latency_statistics.append((
+        "LOOKUP",
+        lookup_latency,
+        self.lookup, # lookup strategy
+        self.pub_num, # num of publishers
+        self.sub_num, # num of subscribers
+        self.mw_obj.dht_num, # num of dht nodes
+        self.name, # id of sub
+      ))
+
+      # save statistics data to the database
+      # self.save_dht_statistics()
 
       # connect to all publishers and subscribe to the topics we are interested in
       self.mw_obj.connect_to_publishers(lookup_resp.addressesToConnectTo)
@@ -375,6 +429,37 @@ class SubscriberAppln ():
     except Exception as e:
       raise e
 
+
+  ########################################
+  # save_dht_statistics
+  ########################################
+  def save_dht_statistics(self):
+    try:
+      connection = mysql.connector.connect(host='18.212.88.188',
+                                          database='dht',
+                                          user='root',
+                                          password='password')
+
+      mySql_insert_query = """INSERT INTO dht_latencies(type_of_request, latency_sec, lookup_strategy, pub_num, sub_num, dht_num, entity_id) 
+      VALUES (%s,%s,%s,%s,%s,%s,%s)"""
+
+      all_data = self.register_latency_statistics + self.isready_latency_statistics + self.lookup_latency_statistics
+
+      cursor = connection.cursor()
+      cursor.executemany(mySql_insert_query, all_data)
+      connection.commit()
+
+      self.logger.info ("Subscriber::save_dht_statistics - {} records inserted successfully into dht_latencies table".format(cursor.rowcount))
+      cursor.close()
+
+    except mysql.connector.Error as error:
+      self.logger.error ("Subscriber::save_dht_statistics - Failed to insert records into Latencies table: {}".format(error))
+
+    finally:
+      if connection and connection.is_connected():
+          connection.close()
+          self.logger.info("Subscriber::save_dht_statistics - MySQL connection is closed")
+    return
 
   ########################################
   # handle receipt of subscription data 
@@ -466,6 +551,9 @@ def parseCmdLineArgs ():
   parser.add_argument("-S", "--subscribers", type=int, default=2, help="Number of subscribers")
 
   parser.add_argument ("-f", "--frequency", type=int,default=1, help="Rate at which topics disseminated: default once a second - use integers")
+
+  #dht_json_path
+  parser.add_argument ("-j", "--dht_json_path", type=str, default='dht.json', help="Info about dht nodes in the ring.")
   
   return parser.parse_args()
 

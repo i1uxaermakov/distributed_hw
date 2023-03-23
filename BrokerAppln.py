@@ -95,6 +95,14 @@ class BrokerAppln ():
       # everything
       self.logger.debug ("BrokerAppln::configure - initialize the middleware object")
       self.mw_obj = BrokerMW (self.logger)
+
+      # First ask our middleware to keep a handle to us to make upcalls.
+      # This is related to upcalls. By passing a pointer to ourselves, the
+      # middleware will keep track of it and any time something must
+      # be handled by the application level, invoke an upcall.
+      self.logger.debug ("BrokerAppln::driver - upcall handle")
+      self.mw_obj.set_upcall_handle (self)
+
       self.mw_obj.configure (args) # pass remainder of the args to the m/w object
       
       self.logger.info ("BrokerAppln::configure - configuration complete")
@@ -113,13 +121,6 @@ class BrokerAppln ():
 
       # dump our contents (debugging purposes)
       self.dump ()
-
-      # First ask our middleware to keep a handle to us to make upcalls.
-      # This is related to upcalls. By passing a pointer to ourselves, the
-      # middleware will keep track of it and any time something must
-      # be handled by the application level, invoke an upcall.
-      self.logger.debug ("BrokerAppln::driver - upcall handle")
-      self.mw_obj.set_upcall_handle (self)
 
       # the next thing we should be doing is to register with the discovery
       # service. But because we are simply delegating everything to an event loop
@@ -354,6 +355,9 @@ def parseCmdLineArgs ():
   parser.add_argument ("-l", "--loglevel", type=int, default=logging.INFO, choices=[logging.DEBUG,logging.INFO,logging.WARNING,logging.ERROR,logging.CRITICAL], help="logging level, choices 10,20,30,40,50: default 20=logging.INFO")
 
   parser.add_argument ("-t", "--timeout", type=int, default=20, help="Timeout for receiving subscription data. If we do not receive data for this many seconds, we assume publishers are done publishing data and we stop the application")
+
+  #dht_json_path
+  parser.add_argument ("-j", "--dht_json_path", type=str, default='dht.json', help="Info about dht nodes in the ring.")
   
   return parser.parse_args()
 

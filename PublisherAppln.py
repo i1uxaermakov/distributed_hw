@@ -49,6 +49,7 @@ import time   # for sleep
 import argparse # for argument parsing
 import configparser # for configuration parsing
 import logging # for logging. Use it in place of print statements.
+import mysql.connector # for working with mysql for analytics
 
 # Import our topic selector. Feel free to use alternate way to
 # get your topics of interest
@@ -93,6 +94,11 @@ class PublisherAppln ():
     self.mw_obj = None # handle to the underlying Middleware object
     self.logger = logger  # internal logger for print statements
     self.experiment_name = None
+    self.imready_timestamp = ""
+    self.register_latency_statistics = []
+    self.isready_latency_statistics = []
+    self.pub_num = None   # number of publishers in the system
+    self.sub_num = None   # number of subscribers in the system
 
   ########################################
   # configure/initialize
@@ -109,6 +115,8 @@ class PublisherAppln ():
       
       # initialize our variables
       self.name = args.name # our name
+      self.pub_num = args.publishers    # number of publishers in the system
+      self.sub_num = args.subscribers    # number of subscribers in the system
       self.iters = args.iters  # num of iterations
       self.frequency = args.frequency # frequency with which topics are disseminated
       self.num_topics = args.num_topics  # total num of topics we publish
@@ -130,7 +138,16 @@ class PublisherAppln ():
       # everything
       self.logger.debug ("PublisherAppln::configure - initialize the middleware object")
       self.mw_obj = PublisherMW (self.logger)
-      self.mw_obj.configure (args) # pass remainder of the args to the m/w object
+
+      # First ask our middleware to keep a handle to us to make upcalls.
+      # This is related to upcalls. By passing a pointer to ourselves, the
+      # middleware will keep track of it and any time something must
+      # be handled by the application level, invoke an upcall.
+      self.logger.debug ("PublisherAppln::driver - upcall handle")
+      self.mw_obj.set_upcall_handle (self)
+
+      # pass remainder of the args to the m/w object
+      self.mw_obj.configure (args) 
       
       self.logger.info ("PublisherAppln::configure - configuration complete")
       
@@ -148,13 +165,6 @@ class PublisherAppln ():
 
       # dump our contents (debugging purposes)
       self.dump ()
-
-      # First ask our middleware to keep a handle to us to make upcalls.
-      # This is related to upcalls. By passing a pointer to ourselves, the
-      # middleware will keep track of it and any time something must
-      # be handled by the application level, invoke an upcall.
-      self.logger.debug ("PublisherAppln::driver - upcall handle")
-      self.mw_obj.set_upcall_handle (self)
 
       # the next thing we should be doing is to register with the discovery
       # service. But because we are simply delegating everything to an event loop
@@ -218,7 +228,7 @@ class PublisherAppln ():
         # and the upcall until we receive the go ahead from the discovery service.
         
         self.logger.debug ("PublisherAppln::invoke_operation - check if are ready to go")
-        self.mw_obj.is_ready ()  # send the is_ready? request
+        self.mw_obj.is_ready (self.imready_timestamp)  # send the is_ready? request
 
         # Remember that we were invoked by the event loop as part of the upcall.
         # So we are going to return back to it for its next iteration. Because
@@ -290,7 +300,7 @@ class PublisherAppln ():
   # of the message and what should be done. So it becomes the job
   # of the application. Hence this upcall is made to us.
   ########################################
-  def register_response (self, reg_resp):
+  def register_response (self, reg_resp, timestamp_sent):
     ''' handle register response '''
 
     try:
@@ -300,13 +310,28 @@ class PublisherAppln ():
 
         # set our next state to isready so that we can then send the isready message right away
         self.state = self.State.ISREADY
+        self.imready_timestamp = str(time.time())
+
+        # Save statistics about register latency
+        cur_timestamp = time.time()
+        sent_timestamp = float(timestamp_sent)
+        register_latency = str(cur_timestamp - sent_timestamp)
+        self.register_latency_statistics.append((
+          "REGISTER",
+          register_latency,
+          self.lookup, # lookup strategy
+          self.pub_num, # num of publishers
+          self.sub_num, # num of subscribers
+          self.mw_obj.dht_num, # num of dht nodes
+          self.name, # id of publisher
+          ))
         
         # return a timeout of zero so that the event loop in its next iteration will immediately make
         # an upcall to us
         return 0
       
       else:
-        self.logger.debug ("PublisherAppln::register_response - registration is a failure with reason {}".format (response.reason))
+        self.logger.debug ("PublisherAppln::register_response - registration is a failure with reason {}".format (reg_resp.reason))
         raise ValueError ("Publisher needs to have unique id")
 
     except Exception as e:
@@ -317,7 +342,7 @@ class PublisherAppln ():
   #
   # Also a part of upcall handled by application logic
   ########################################
-  def isready_response (self, isready_resp):
+  def isready_response (self, isready_resp, timestamp_sent):
     ''' handle isready response '''
 
     try:
@@ -326,16 +351,35 @@ class PublisherAppln ():
       # Notice how we get that loop effect with the sleep (10)
       # by an interaction between the event loop and these
       # upcall methods.
+      self.logger.info (f"PublisherAppln - {isready_resp.status}")
       if not isready_resp.status:
         # discovery service is not ready yet
         self.logger.debug ("PublisherAppln::driver - Not ready yet; check again")
-        time.sleep (10)  # sleep between calls so that we don't make excessive calls
+        # Disabling sleeping to check is_ready latency
+        # time.sleep (10)  # sleep between calls so that we don't make excessive calls
         # return 5 * 1000 # timeout of this many seconds
 
       else:
         # we got the go ahead
         # set the state to disseminate
         self.state = self.State.DISSEMINATE
+
+        # Save statistics about is_ready latency
+        cur_timestamp = time.time()
+        sent_timestamp = float(timestamp_sent)
+        isready_latency = str(cur_timestamp - sent_timestamp)
+        self.isready_latency_statistics.append((
+          "ISREADY",
+          isready_latency,
+          self.lookup, # lookup strategy
+          self.pub_num, # num of publishers
+          self.sub_num, # num of subscribers
+          self.mw_obj.dht_num, # num of dht nodes
+          self.name # id of publisher
+          ))
+        
+        # save statistics data to the database
+        # self.save_dht_statistics()
         
       # return timeout of 0 so event loop calls us back in the invoke_operation
       # method, where we take action based on what state we are in.
@@ -343,6 +387,42 @@ class PublisherAppln ():
     
     except Exception as e:
       raise e
+
+  ########################################
+  # save_dht_statistics
+  ########################################
+  def save_dht_statistics(self):
+    try:
+      connection = mysql.connector.connect(host='18.212.88.188',
+                                          database='dht',
+                                          user='root',
+                                          password='password')
+
+      mySql_insert_query = """INSERT INTO dht_latencies(type_of_request, latency_sec, lookup_strategy, pub_num, sub_num, dht_num, entity_id) 
+      VALUES (%s,%s,%s,%s,%s,%s,%s)"""
+
+      all_data = self.register_latency_statistics + self.isready_latency_statistics
+
+      cursor = connection.cursor()
+      cursor.executemany(mySql_insert_query, all_data)
+      connection.commit()
+
+      self.logger.info (f"register: {str(self.register_latency_statistics)}")
+      self.logger.info (f"isready: {str(self.isready_latency_statistics)}")
+
+      self.logger.info ("Publisher::save_dht_statistics - {} records inserted successfully into dht_latencies table".format(cursor.rowcount))
+      cursor.close()
+
+    except mysql.connector.Error as error:
+      self.logger.error ("Publisher::save_dht_statistics - Failed to insert records into Latencies table: {}".format(error))
+
+    finally:
+      if connection and connection.is_connected():
+          connection.close()
+          self.logger.info("Publisher::save_dht_statistics - MySQL connection is closed")
+
+    return
+
 
   ########################################
   # dump the contents of the object 
@@ -393,13 +473,20 @@ def parseCmdLineArgs ():
 
   parser.add_argument ("-c", "--config", default="config.ini", help="configuration file (default: config.ini)")
 
-  parser.add_argument ("-f", "--frequency", type=int,default=1, help="Rate at which topics disseminated: default once a second - use integers")
+  parser.add_argument ("-f", "--frequency", type=float, default=1, help="Rate at which topics disseminated: default once a second - use floats")
 
   parser.add_argument ("-i", "--iters", type=int, default=10, help="number of publication iterations (default: 20)")
 
   parser.add_argument ("-l", "--loglevel", type=int, default=logging.INFO, choices=[logging.DEBUG,logging.INFO,logging.WARNING,logging.ERROR,logging.CRITICAL], help="logging level, choices 10,20,30,40,50: default 20=logging.INFO")
 
   parser.add_argument("-en", "--experiment_name", default="exp", help="name of the experiment we are running, will be included in the payload sent to the subscribers")
+
+  #dht_json_path
+  parser.add_argument ("-j", "--dht_json_path", type=str, default='dht.json', help="Info about dht nodes in the ring.")
+
+  parser.add_argument("-P", "--publishers", type=int, default=2, help="Number of publishers")
+
+  parser.add_argument("-S", "--subscribers", type=int, default=2, help="Number of subscribers")
   
   return parser.parse_args()
 

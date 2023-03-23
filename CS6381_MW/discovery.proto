@@ -35,6 +35,7 @@ enum MsgTypes {
      TYPE_ISREADY = 2;    // needed by publisher to know if it can proceed
      TYPE_LOOKUP_PUB_BY_TOPIC = 3;  // needed by a subscriber
      TYPE_LOOKUP_ALL_PUBS = 4;   // probably needed by broker
+     TYPE_DHT = 5;
      // anything more
 }
 
@@ -63,13 +64,26 @@ message RegisterResp
     optional string reason = 2; // reason for failure
 }
 
+
+message DhtIsReadyPayload
+{
+    repeated string visited_nodes = 1;
+    repeated string registered_subs = 2;
+    repeated string registered_pubs = 3;
+    repeated string registered_brokers = 4;
+}
+
 // define a message type that publishers might send to a discovery service
 // to see if the system is all ready and if they can proceed to publish their
 // topics. Accordingly, there will be a req and resp message types.
 message IsReadyReq
 {
-   // we really don't need to send any field
+   // we really don't need to send any field for non-DHT lookup
+   // Use dht_payload for DHT lookup
+   optional DhtIsReadyPayload dht_payload = 1;
 }
+
+// h21 python3 BrokerAppln.py -n broker1 -j dht10_ent20.json -a 10.0.0.21 -p 7777 > broker1.out 2>&1 &
 
 // Response to the IsReady request
 message IsReadyResp
@@ -88,6 +102,8 @@ message IsReadyResp
 message LookupPubByTopicReq
 {
     repeated string topiclist = 1; // modify this appropriately
+    repeated string visited_nodes = 2; // For DHT ring
+    repeated string sockets_to_connect_to = 3; // For DHT ring, acts as a collector
 }
 
 // Corresponding response to the lookupPubByTopic request
@@ -107,7 +123,9 @@ message DiscoveryReq
               IsReadyReq isready_req = 3;
               LookupPubByTopicReq lookup_req = 4;
               // add more 
-        }
+        };
+        optional bool do_read_or_write = 6;
+        optional string timestamp_sent = 7;
 }
 
 // Response to discovery req will be similar oneof of the responses.
@@ -120,5 +138,5 @@ message DiscoveryResp
               LookupPubByTopicResp lookup_resp = 4;
               // add more 
         }
+        optional string timestamp_sent = 7;
 }
-

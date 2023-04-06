@@ -53,6 +53,12 @@ class DiscoveryMW ():
     self.dht_json_path = None
     self.my_dht_hash = None
 
+    # Zookeeper-related fields
+    self.sync_pub_socket = None # Socket for publishing updates in case you are a leader
+    self.sync_pub_port = None # Port for the pub socket
+    self.sync_sub_socket = None # Socket for subscribing to updates from the leader discovery
+    
+
 
   ########################################
   # configure/initialize
@@ -87,8 +93,9 @@ class DiscoveryMW ():
       self.dht_json_path = args.dht_json_path
       self.name = args.name
 
-      # Set up the finger table
+      # If using DHT Lookup
       if(self.upcall_obj.lookup == "DHT"):
+        # Set up the finger table
         # Set up the table entries
         self.set_up_finger_table()
         
@@ -108,13 +115,22 @@ class DiscoveryMW ():
           # register the dealer socket with poller
           self.poller.register (entry.dealer_socket, zmq.POLLIN)
 
+      # If using ZooKeeper lookup
+      elif(self.upcall_obj.lookup == 'ZooKeeper'):
+        # set up sockets
+        self.sync_pub_port = args.sub_port
+        self.sync_pub_socket = context.socket(zmq.PUB)
+        bind_string = "tcp://*:" + str(self.sync_pub_port)
+        self.sync_pub_socket.bind (bind_string)
+        
+        self.sync_sub_socket = context.socket(zmq.SUB)
       
       # Now bind to the socket for incoming requests. We are ready to accept requests from anyone, so the string is tcp://*:*
       self.logger.debug ("DiscoveryMW::configure - bind to the socket and port")
       bind_str = "tcp://*:" + str(self.port)
       self.router.bind (bind_str)
       
-      self.logger.info ("DiscoveryMW::configure completed")
+      self.logger.debug ("DiscoveryMW::configure completed")
 
     except Exception as e:
       raise e
@@ -195,6 +211,11 @@ class DiscoveryMW ():
           timeout = self.handle_request ()
           request_handled = True
 
+        if (not request_handled) and (self.sync_sub_socket in events):
+          # handle a sync request from leader discovery
+          timeout = self.handle_state_sync_request ()
+          request_handled = True
+
         if (self.upcall_obj.lookup == "DHT") and (not request_handled):
           # check all dealer sockets in case we are using DHT ring
           for entry in self.finger_table:
@@ -220,13 +241,13 @@ class DiscoveryMW ():
   def handle_request (self):
 
     try:
-      self.logger.info ("DiscoveryMW::handle_request")
+      self.logger.debug ("DiscoveryMW::handle_request")
 
       # Receive all frames
       framesRcvd = self.router.recv_multipart()
       bytesRcvd = framesRcvd[-1]
-      self.logger.info ("DiscoveryMW::handle_request – received bytes and frames")
-      self.logger.info (f"DiscoveryMW::handle_request – frames received: {framesRcvd}")
+      self.logger.debug ("DiscoveryMW::handle_request – received bytes and frames")
+      self.logger.debug (f"DiscoveryMW::handle_request – frames received: {framesRcvd}")
 
       # now use protobuf to deserialize the bytes
       # The way to do this is to first allocate the space for the
@@ -240,33 +261,33 @@ class DiscoveryMW ():
       # Note also that we expect the return value to be the desired timeout to use
       # in the next iteration of the poll.
       if (disc_req.msg_type == discovery_pb2.TYPE_REGISTER):
-        self.logger.info (f"DiscoveryMW::handle_request – Received a register request: do_read_or_write {disc_req.do_read_or_write}, from {disc_req.register_req.info.id}")
+        self.logger.debug (f"DiscoveryMW::handle_request – Received a register request: do_read_or_write {disc_req.do_read_or_write}, from {disc_req.register_req.info.id}")
 
         if(self.upcall_obj.lookup == "DHT"):
-          self.logger.info ("DiscoveryMW::handle_request – Processing a DHT Register request")
+          self.logger.debug ("DiscoveryMW::handle_request – Processing a DHT Register request")
           # If this node is the one responsible for the current hash, save data and respond to request
           if (disc_req.do_read_or_write):
-            self.logger.info ("DiscoveryMW::handle_request – We are the node responsible for the hash")
+            self.logger.debug ("DiscoveryMW::handle_request – We are the node responsible for the hash")
             # let the appln level object decide what to do
-            self.logger.info ("DiscoveryMW::handle_request – sending the REGISTER request to be handled in the upcall object because we are the DHT node that needs to handle it")
+            self.logger.debug ("DiscoveryMW::handle_request – sending the REGISTER request to be handled in the upcall object because we are the DHT node that needs to handle it")
             timeout = self.upcall_obj.handle_register_request (disc_req.register_req, framesRcvd, disc_req.timestamp_sent)
           else:
             # If the current node is not the one holding the hash, compute the next node to forward request to and send the message there
 
-            self.logger.info ("DiscoveryMW::handle_request – The node responsible for hash hasn't been identified, so we try to find it")
+            self.logger.debug ("DiscoveryMW::handle_request – The node responsible for hash hasn't been identified, so we try to find it")
 
             # Compute hash
             entity_hash = self.compute_hash_for_registring_entity(disc_req.register_req)
 
             # Find what node to forward the request to based on the hash
             node, found_the_one = self.find_successor(entity_hash)
-            self.logger.info (f"DiscoveryMW::handle_request – found_the_one={found_the_one}")
+            self.logger.debug (f"DiscoveryMW::handle_request – found_the_one={found_the_one}")
 
             # Construct the message
             new_disc_req = self.create_register_req_to_next_dht_node(disc_req, found_the_one)
             buf2send = new_disc_req.SerializeToString ()
 
-            self.logger.info (f"DiscoveryMW::handle_request – Forwarding the request from myself (node {self.upcall_obj.name}) to node: {node.node_info['id']}, do_read_or_write={new_disc_req.do_read_or_write}")
+            self.logger.debug (f"DiscoveryMW::handle_request – Forwarding the request from myself (node {self.upcall_obj.name}) to node: {node.node_info['id']}, do_read_or_write={new_disc_req.do_read_or_write}")
 
             # Update the message in the frames
             framesRcvd[-1] = buf2send
@@ -279,22 +300,22 @@ class DiscoveryMW ():
         # NOT using DHT lookup
         else: 
           # let the appln level object decide what to do
-          self.logger.info ("DiscoveryMW::handle_request – sending the REGISTER request to be handled in the upcall object")
+          self.logger.debug ("DiscoveryMW::handle_request – sending the REGISTER request to be handled in the upcall object")
           timeout = self.upcall_obj.handle_register_request (disc_req.register_req, framesRcvd, disc_req.timestamp_sent)
       
       elif (disc_req.msg_type == discovery_pb2.TYPE_ISREADY):
         # this is a response to is ready request
-        self.logger.info ("DiscoveryMW::handle_request – sending the ISREADY request to be handled in the upcall object")
+        self.logger.debug ("DiscoveryMW::handle_request – sending the ISREADY request to be handled in the upcall object")
         timeout = self.upcall_obj.handle_isready_request (disc_req.isready_req, framesRcvd, disc_req.timestamp_sent)
       
       elif (disc_req.msg_type == discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC):
         # received a lookup request
-        self.logger.info ("DiscoveryMW::handle_request – sending the LOOKUP PUBLISHERS BY TOPICS request to be handled in the upcall object")
+        self.logger.debug ("DiscoveryMW::handle_request – sending the LOOKUP PUBLISHERS BY TOPICS request to be handled in the upcall object")
         timeout = self.upcall_obj.handle_lookup_pub_by_topics(disc_req.lookup_req, False, framesRcvd, disc_req.timestamp_sent)
 
       elif (disc_req.msg_type == discovery_pb2.TYPE_LOOKUP_ALL_PUBS):
         # received a lookup request
-        self.logger.info ("DiscoveryMW::handle_request – sending the LOOKUP ALL PUBLISHERS request to be handled in the upcall object")
+        self.logger.debug ("DiscoveryMW::handle_request – sending the LOOKUP ALL PUBLISHERS request to be handled in the upcall object")
         timeout = self.upcall_obj.handle_lookup_pub_by_topics(disc_req.lookup_req, True, framesRcvd, disc_req.timestamp_sent)
 
       else: # anything else is unrecognizable by this object
@@ -480,14 +501,14 @@ class DiscoveryMW ():
     ''' respond_to_register_request '''
 
     try:
-      self.logger.info ("DiscoveryMW::respond_to_register_request")
+      self.logger.debug ("DiscoveryMW::respond_to_register_request")
     
       # Create the payload for register response
       register_response = discovery_pb2.RegisterResp()
       if(was_successful):
         register_response.status = discovery_pb2.STATUS_SUCCESS
       else:
-        register_response.status = discovery_pb2.FAILURE
+        register_response.status = discovery_pb2.STATUS_FAILURE
         register_response.reason = reason
 
       # Finally, build the outer layer DiscoveryResp Message
@@ -525,7 +546,7 @@ class DiscoveryMW ():
     ''' respond_to_isready_request '''
 
     try:
-      self.logger.info ("DiscoveryMW::respond_to_isready_request")
+      self.logger.debug ("DiscoveryMW::respond_to_isready_request")
     
       # Create the payload for register response
       isready_response = discovery_pb2.IsReadyResp()
@@ -564,7 +585,7 @@ class DiscoveryMW ():
     ''' respond_to_lookup_request '''
 
     try:
-      self.logger.info ("DiscoveryMW::respond_to_lookup_request")
+      self.logger.debug ("DiscoveryMW::respond_to_lookup_request")
     
       # Create the payload for register response
       lookup_response = discovery_pb2.LookupPubByTopicResp()
@@ -619,3 +640,96 @@ class DiscoveryMW ():
   def disable_event_loop (self):
     ''' disable event loop '''
     self.handle_events = False
+
+
+
+  ########################################
+  # subscribe_for_updates_from_leader
+  #
+  ########################################
+  def subscribe_for_updates_from_leader(self, leader_addr, leader_sub_port):
+    # Connect to the leader
+    self.logger.info(f'MW: Connecting to {"tcp://" + leader_addr + str(leader_sub_port)}')
+    self.sync_sub_socket.connect ("tcp://" + leader_addr + ':' + str(leader_sub_port))
+    
+    # Subscribe to discovery updates
+    self.sync_sub_socket.setsockopt (zmq.SUBSCRIBE, bytes('discovery', 'utf-8'))
+
+    # Register with poller
+    self.poller.register (self.sync_sub_socket, zmq.POLLIN)
+    return
+  
+
+  ########################################
+  # publish_discovery_update
+  # 
+  # Used when a new entity (publisher) registers, tells other discoveries to sync state
+  ########################################
+  def publish_discovery_update(self):
+    # We send all of the state we have
+    state = {
+      'registered_publishers': list(self.upcall_obj.registered_publishers),
+      'publisher_id_to_ipport_mapping': self.upcall_obj.publisher_id_to_ipport_mapping,
+      'topic_to_publishers_id_mapping': self.upcall_obj.topic_to_publishers_id_mapping,
+      'registered_subscribers': list(self.upcall_obj.registered_subscribers),
+      'registered_brokers': list(self.upcall_obj.registered_brokers),
+      'broker_id_to_ipport_mapping': self.upcall_obj.broker_id_to_ipport_mapping
+    }
+    state_bytes = json.dumps(state).encode('utf-8')
+
+    self.logger.info(f"Publishing a DISCOVERY SYNC update: {str(state)}")
+
+    # Send from the socket
+    send_str = b'discovery:' + state_bytes
+    self.sync_pub_socket.send (send_str)
+
+    return
+
+  ########################################
+  # publish_unsub_update
+  # 
+  # Used when a publisher or broker dies
+  ########################################
+  def publish_unsub_update(self, unsub_update_body):
+    self.logger.info(f"Publishing a UNSUB update: {str(unsub_update_body)}")
+    unsub_update_bytes = json.dumps(unsub_update_body).encode('utf-8')
+    
+    # Send from the socket
+    send_str = b'unsub:' + unsub_update_bytes
+    self.sync_pub_socket.send (send_str)
+    return
+  
+  ########################################
+  # publish_sub_update – update to subscription (i.e. update who you are subscribed to)
+  # 
+  # Used when a publisher has registered or a new broker leader has been elected. Tells brokers and subscribers to subscribe to it
+  ########################################
+  def publish_sub_update(self, sub_update_body):
+    self.logger.info(f"Publishing a SUB update: {str(sub_update_body)}")
+    sub_update_bytes = json.dumps(sub_update_body).encode('utf-8')
+    
+    # Send from the socket
+    send_str = b'sub:' + sub_update_bytes
+    self.sync_pub_socket.send (send_str)
+    return
+  
+  ########################################
+  # handle_state_sync_request
+  # 
+  # Handle an update to the state. A primary Discovery service has sent us a request, so we update our state
+  ########################################  
+  def handle_state_sync_request(self):
+    self.logger.info("Handling a state sync request")
+
+    # Get the message from SUB socket
+    # Receive all frames
+    bytesRcvd = self.sync_sub_socket.recv()
+    bytesRcvd = bytesRcvd.decode('utf-8')
+    beginning_of_payload = (bytesRcvd.find(':') + 1)
+    string_received = bytesRcvd[beginning_of_payload:]
+    data_dict = json.loads(string_received)
+
+    # Update the state in the upcall object
+    self.upcall_obj.update_state(data_dict)
+      
+    return None

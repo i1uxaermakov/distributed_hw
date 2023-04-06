@@ -66,7 +66,7 @@ class PublisherMW ():
 
     try:
       # Here we initialize any internal variables
-      self.logger.info ("PublisherMW::configure")
+      self.logger.debug ("PublisherMW::configure")
 
       # First retrieve our advertised IP addr and the publication port num
       self.port = args.port
@@ -99,7 +99,7 @@ class PublisherMW ():
       # Now connect ourselves to the discovery service. Recall that the IP/port were
       # supplied in our argument parsing. Best practices of ZQM suggest that the
       # one who maintains the REQ socket should do the "connect"
-      self.logger.info ("PublisherMW::configure - connect to Discovery service")
+      self.logger.debug ("PublisherMW::configure - connect to Discovery service")
       
       # if we are using DHT lookup, we are connecting to a random node in DHT file
       # otherwise, we are connecting to the discovery service specified in the parameters
@@ -110,12 +110,16 @@ class PublisherMW ():
         self.dht_num = dht_nodes_number
         random_index = random.randint(0, dht_nodes_number-1)
         randomly_chosen_dht = dht_file['dht'][random_index]
-        self.logger.info (f"PublisherMW::configure - connect to DHT Discovery service: {randomly_chosen_dht}")
+        self.logger.debug (f"PublisherMW::configure - connect to DHT Discovery service: {randomly_chosen_dht}")
         connect_str = "tcp://" + randomly_chosen_dht['IP'] + ":" + str(randomly_chosen_dht['port'])
-      else:
-        connect_str = "tcp://" + args.discovery
+        self.req.connect (connect_str)
       
-      self.req.connect (connect_str)
+      elif (self.upcall_obj.lookup == "Centralized"):
+        connect_str = "tcp://" + args.discovery
+        # connect to discovery
+        self.req.connect (connect_str)
+      
+      # No additional setup needed for Publisher in case of ZookeeperLookup
       
       # Since we are the publisher, the best practice as suggested in ZMQ is for us to
       # "bind" the PUB socket
@@ -126,7 +130,7 @@ class PublisherMW ():
       bind_string = "tcp://*:" + str(self.port)
       self.pub.bind (bind_string)
       
-      self.logger.info ("PublisherMW::configure completed")
+      self.logger.debug ("PublisherMW::configure completed")
 
     except Exception as e:
       raise e
@@ -137,7 +141,7 @@ class PublisherMW ():
   def event_loop (self, timeout=None):
 
     try:
-      self.logger.info ("PublisherMW::event_loop - run the event loop")
+      self.logger.debug ("PublisherMW::event_loop - run the event loop")
 
       # we are using a class variable called "handle_events" which is set to
       # True but can be set out of band to False in order to exit this forever
@@ -169,7 +173,7 @@ class PublisherMW ():
         else:
           raise Exception ("Unknown event after poll")
 
-      self.logger.info ("PublisherMW::event_loop - out of the event loop")
+      self.logger.debug ("PublisherMW::event_loop - out of the event loop")
     except Exception as e:
       raise e
             
@@ -179,7 +183,7 @@ class PublisherMW ():
   def handle_reply (self):
 
     try:
-      self.logger.info ("PublisherMW::handle_reply")
+      self.logger.debug ("PublisherMW::handle_reply")
 
       # let us first receive all the bytes
       bytesRcvd = self.req.recv ()
@@ -227,7 +231,7 @@ class PublisherMW ():
     ''' register the appln with the discovery service '''
 
     try:
-      self.logger.info ("PublisherMW::register")
+      self.logger.debug ("PublisherMW::register")
 
       # as part of registration with the discovery service, we send
       # what role we are playing, the list of topics we are publishing,
@@ -273,7 +277,7 @@ class PublisherMW ():
       self.req.send (buf2send)  # we use the "send" method of ZMQ that sends the bytes
 
       # now go to our event loop to receive a response to this request
-      self.logger.info ("PublisherMW::register - sent register message and now now wait for reply")
+      self.logger.debug ("PublisherMW::register - sent register message and now now wait for reply")
     
     except Exception as e:
       raise e
@@ -290,7 +294,7 @@ class PublisherMW ():
     ''' register the appln with the discovery service '''
 
     try:
-      self.logger.info ("PublisherMW::is_ready")
+      self.logger.debug ("PublisherMW::is_ready")
 
       # we do a similar kind of serialization as we did in the register
       # message but much simpler as the message format is very simple.
@@ -324,7 +328,7 @@ class PublisherMW ():
       self.req.send (buf2send)  # we use the "send" method of ZMQ that sends the bytes
       
       # now go to our event loop to receive a response to this request
-      self.logger.info ("PublisherMW::is_ready - request sent and now wait for reply")
+      self.logger.debug ("PublisherMW::is_ready - request sent and now wait for reply")
       
     except Exception as e:
       raise e
@@ -375,4 +379,24 @@ class PublisherMW ():
   def disable_event_loop (self):
     ''' disable event loop '''
     self.handle_events = False
+
+  ########################################
+  # connect_to_discovery_leader
+  #
+  # Connect to discovery leader on REQ socket
+  ########################################
+  def connect_to_discovery_leader(self, disc_addr, disc_port):
+    # Connect the req socket
+    self.req.connect('tcp://' + disc_addr + ':' + str(disc_port))
+    return
+  
+  ########################################
+  # disconnect_from_old_discovery_leader
+  #
+  # Connect to discovery leader on REQ
+  ########################################
+  def disconnect_from_old_discovery_leader(self, old_addr, old_port):
+    # Disconnect REQ socket
+    self.req.disconnect('tcp://' + old_addr + ':' + str(old_port))
+    return
 

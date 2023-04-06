@@ -49,6 +49,11 @@ from CS6381_MW import discovery_pb2
 # import any other packages you need.
 from enum import Enum  # for an enumeration we are using to describe what state we are in
 
+# Objects to interact with Zookeeper
+from kazoo.client import KazooClient
+from kazoo.exceptions import NodeExistsError
+import json
+
 
 ##################################
 #       SubscriberAppln class
@@ -86,6 +91,16 @@ class SubscriberAppln ():
     self.register_latency_statistics = []
     self.isready_latency_statistics = []
     self.lookup_latency_statistics = []
+
+    # Zookeeper-related variables
+    self.zk_client = None
+    self.discovery = None
+    self.discovery_leader_addr = None 
+    self.discovery_leader_port = None
+    self.discovery_leader_sync_port = None
+    self.count_msg_rcvd = 0
+
+
 
   ########################################
   # configure/initialize
@@ -134,12 +149,59 @@ class SubscriberAppln ():
 
       # pass remainder of the args to the m/w object
       self.mw_obj.configure (args) 
+
+      # Connect to Zookeeper to establish connection with Primary Discovery
+      if(self.lookup == 'ZooKeeper'):
+        self.zookeeper_addr = args.zookeeper
+        self.zk_client = KazooClient(hosts=self.zookeeper_addr)
+        self.zk_client.start()
+        
+
+        # If exists, get value, set up watch
+        # If doesn't exist, set up a watch
+        discovery_leader_path = '/discovery/leader'
+
+        # spin while we are waiting for primary discovery to appear
+        while True:
+          if(self.zk_client.exists(discovery_leader_path)):
+            # Retrieve info about the leader
+            leader_info = self.get_data_about_discovery_leader()
+
+            # update discovery leader info
+            self.discovery_leader_addr = leader_info['addr']
+            self.discovery_leader_port = leader_info['port']
+            self.discovery_leader_sync_port = leader_info['sub_port']
+            
+            # Connect to the new discovery and subscribe for updates from it
+            self.mw_obj.connect_to_discovery_leader(leader_info['addr'], leader_info['port'], leader_info['sub_port'])
+
+            break
+
+          else:
+            # Node does not exist yet, so we wait
+            time.sleep(1)
+
+        
+
+      # If using a Centralized Discovery lookup
+      else:
+        self.discovery = args.discovery
       
       self.logger.info ("SubscriberAppln::configure - configuration complete")
       
     except Exception as e:
       raise e
   
+
+
+  ########################################
+  # get_data_about_discovery_leader
+  ########################################
+  def get_data_about_discovery_leader(self):
+    disc_leader_data, _ = self.zk_client.get('/discovery/leader')
+    data_dict = json.loads(disc_leader_data.decode('utf-8'))
+    return data_dict
+
   
   ########################################
   # driver program
@@ -349,7 +411,7 @@ class SubscriberAppln ():
     ''' handle isready response '''
 
     try:
-      self.logger.info ("SubscriberAppln::handle_isready_response")
+      self.logger.debug ("SubscriberAppln::handle_isready_response")
 
       # Notice how we get that loop effect with the sleep (10)
       # by an interaction between the event loop and these
@@ -362,6 +424,8 @@ class SubscriberAppln ():
         # time.sleep (5)  # sleep between calls so that we don't make excessive calls
 
       else:
+        self.logger.info ("SubscriberAppln::handle_isready_response - READY!")
+
         # we got the go ahead
         # we now look up publishers to connect to
         self.state = self.State.LOOKUP_PUBLISHERS
@@ -424,7 +488,8 @@ class SubscriberAppln ():
       
       # return standard timeout for subscription data
       # if we do not receive data for this many milliseconds, we finish application
-      return self.timeout
+      # CHANGE IF NEEDED TO self.timeout
+      return None
     
     except Exception as e:
       raise e
@@ -468,9 +533,9 @@ class SubscriberAppln ():
     ''' handle_receipt_of_subscription_data '''
 
     try:
-      self.logger.info ("SubscriberAppln::handle_receipt_of_subscription_data")
+      self.logger.debug ("SubscriberAppln::handle_receipt_of_subscription_data")
 
-      self.logger.info("RECEIVED DATA: %s", string_received)
+      # self.logger.info("RECEIVED DATA: %s", string_received)
       beginning_of_payload = (string_received.find(':') + 1)
       string_received = string_received[beginning_of_payload:]
 
@@ -480,21 +545,37 @@ class SubscriberAppln ():
       sent_timestamp = float(data['sent_timestamp'])
       latency = str(cur_timestamp - sent_timestamp)
 
+
+      self.logger.info(f"RECEIVED DATA from {data['pubid']}")
+      self.count_msg_rcvd = self.count_msg_rcvd + 1
+
       # INSERT INTO latencies(latency_sec, frequency, num_topics, pub_num, sub_num, pub_id, sub_id, experiment_name) VALUES ();
-      self.latency_data.append((
-        latency, 
-        self.freq, 
-        self.num_topics, 
-        self.pub_num,
-        self.sub_num,
-        self.dissemination,
-        data['pubid'], 
-        self.name, 
-        data['exp_name']))
+      # self.latency_data.append((
+      #   latency, 
+      #   self.freq, 
+      #   self.num_topics, 
+      #   self.pub_num,
+      #   self.sub_num,
+      #   self.dissemination,
+      #   data['pubid'], 
+      #   self.name, 
+      #   data['exp_name']))
+      
+      self.latency_data.append(cur_timestamp)
+      
+      if(self.count_msg_rcvd >= 20):
+        # Open a file in write mode
+        file = open(f"{self.name}_broker_disc.txt", "w+")
+
+        for tstmp in self.latency_data:
+          file.write(f"{str(tstmp)}\n")
+
+        # Close the file
+        file.close()
       
       # return standard timeout for subscription data
       # if we do not receive data for this many milliseconds, we finish application
-      return self.timeout
+      return None
     
     except Exception as e:
       raise e
@@ -554,6 +635,10 @@ def parseCmdLineArgs ():
 
   #dht_json_path
   parser.add_argument ("-j", "--dht_json_path", type=str, default='dht.json', help="Info about dht nodes in the ring.")
+
+  # address of Zookeeper
+  parser.add_argument("-z", "--zookeeper", default='localhost:2181', help="Address of the Zookeeper instance")
+
   
   return parser.parse_args()
 

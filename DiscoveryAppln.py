@@ -49,6 +49,11 @@ from CS6381_MW import discovery_pb2
 # import any other packages you need.
 from enum import Enum  # for an enumeration we are using to describe what state we are in
 
+# Objects to interact with Zookeeper
+from kazoo.client import KazooClient
+from kazoo.exceptions import NodeExistsError
+import json
+
 
 
 ##################################
@@ -89,6 +94,14 @@ class DiscoveryAppln ():
     self.registered_brokers = set() # set of strings, where each string is ip:port of a broker
     self.broker_id_to_ipport_mapping = {}
 
+    # Zookeeper-related variables
+    self.zk_client = None
+    self.zk_am_leader = False
+    self.addr = None
+    self.sub_port = None
+    self.broker_leader = None
+    self.port = None
+
 
   ########################################
   # configure/initialize
@@ -97,7 +110,7 @@ class DiscoveryAppln ():
 
     try:
       # Here we initialize any internal variables
-      self.logger.info ("DiscoveryAppln::configure")
+      self.logger.debug ("DiscoveryAppln::configure")
 
       # set our current state to CONFIGURE state
       self.state = self.State.CONFIGURE
@@ -128,11 +141,214 @@ class DiscoveryAppln ():
 
       # pass remainder of the args to the m/w object
       self.mw_obj.configure (args) 
-      
-      self.logger.info ("DiscoveryAppln::configure - configuration complete")
+
+      self.addr = args.addr
+      self.sub_port = args.sub_port
+      self.port = args.port
+
+      # if Zookeeper lookup is used, create /discovery/leader node
+      if (self.lookup == 'ZooKeeper'):
+        self.zookeeper_addr = args.zookeeper
+        self.zk_client = KazooClient(hosts=self.zookeeper_addr)
+        self.zk_client.start()
+
+        # Conduct the election of a leader
+        self.zk_am_leader = self.register_discovery_with_zookeeper()
+        
+        # Start a children watch on /discovery
+        @self.zk_client.ChildrenWatch('/discovery')
+        def watch_discovery_children(children):
+          if(len(children) == 0):
+            # if we get triggered, this means a discovery node has died, so we need to elect a new discovery leader and subscribe to it if we are not the leader
+            self.zk_am_leader = self.register_discovery_with_zookeeper()
+          return
+        
+        # After selecting a leader, subscribe to /pubs, /brokers nodes with child watch
+        # Whenever they get triggered, we check whether a new one has joined or a publisher/broker died
+        pubs_path = '/pubs'
+        self.zk_client.ensure_path(pubs_path)
+        @self.zk_client.ChildrenWatch(pubs_path)
+        def watch_pubs_children(children):
+          self.process_pubs_child_trigger(children)
+
+        # If using Broker dissemination, set up a watch for broker leader too
+        if(self.dissemination == 'Broker'):
+          brokers_path = '/brokers'
+          self.zk_client.ensure_path(brokers_path)
+          @self.zk_client.ChildrenWatch(brokers_path)
+          def watch_brokers_children(children):
+            self.process_brokers_child_trigger(children)
+
+
+      self.logger.debug ("DiscoveryAppln::configure - configuration complete")
       
     except Exception as e:
       raise e
+
+
+  ########################################
+  # register_discovery_with_zookeeper
+  #
+  # Return true if we became a leader, false otherwise
+  ########################################
+  def register_discovery_with_zookeeper(self):
+    path = '/discovery/leader'
+
+    # Create an ephemeral node for Discovery leader
+    try:
+      # Data to store in the node
+      data_dict = {
+        'addr': self.addr,
+        'port': self.port,
+        'sub_port': self.sub_port,
+        'name': self.name
+      }
+      data_bytes = json.dumps(data_dict).encode('utf-8')
+
+      # Try to create the ephemeral node
+      self.zk_client.create(path, ephemeral=True, makepath=True, value=data_bytes)
+      self.logger.info ("Ephemeral /discovery/leader successfully created, we are a leader")
+      return True
+    
+    except NodeExistsError:
+      # Handle the case where the node already exists
+      self.logger.info ("Ephemeral /discovery/leader node already exists, we are NOT a leader")
+
+      # Get data from the node
+      data_bytes, _ = self.zk_client.get(path)
+      data_dict = json.loads(data_bytes.decode('utf-8'))
+
+      # Subscribe for updates from primary discovery
+      self.logger.info (f"Connecting to leader to receive updates: {self.name} at {data_dict['addr']}:{data_dict['sub_port']}")
+      self.mw_obj.subscribe_for_updates_from_leader(data_dict['addr'], data_dict['sub_port'])
+
+      return False
+      
+
+  ########################################
+  # process_pubs_child_trigger
+  #
+  # Function that is called whenever the 
+  # children of /pubs node change
+  ########################################
+  def process_pubs_child_trigger(self, current_children):
+    # Go over current children and check which ones are present in the list of publishers
+    self.logger.info('Pubs watch triggered')
+    registered_publishers = self.registered_publishers.copy()
+
+    for child in current_children:
+      if child not in registered_publishers:
+        # a node exists but discovery doesn't know about that publisher
+        # we assume this happened because the publisher created a node but hasn't yet registered with the discovery
+        # discregard the node since we will notify the brokers/subscribers of the new publisher once they register
+        continue
+      else:
+        # remove child from registered_publishers so that the set only contains the publishers that have registered before but now don't have a node in ZooKeeper
+        registered_publishers.remove(child)
+
+    # registered_publishers now contains the publishers that died
+    # notify subscribers and brokers of the nodes they need to unsubscribe from
+    self.logger.info(f'Died publishers: {registered_publishers}')
+
+    for died_publisher_name in registered_publishers:
+      ipport = self.publisher_id_to_ipport_mapping[died_publisher_name]
+      beginning_of_port = (ipport.find(':') + 1)
+      ip = ipport[:(beginning_of_port-1)]
+      port = ipport[beginning_of_port:]
+
+      # Send an update to subscribers and brokers about the publisher that died
+      unsub_update = {
+        'addr': ip,
+        'port': port
+      }
+      self.mw_obj.publish_unsub_update(unsub_update)
+
+      # Remove the publisher from state
+      self.registered_publishers.remove(died_publisher_name)
+      del self.publisher_id_to_ipport_mapping[died_publisher_name]
+      for topic in self.topic_to_publishers_id_mapping:
+        if died_publisher_name in self.topic_to_publishers_id_mapping[topic]:
+          self.topic_to_publishers_id_mapping[topic].remove(died_publisher_name)
+    
+    self.logger.info(f'New State: reg_pubs:{self.registered_publishers}, pub_ipport:{self.publisher_id_to_ipport_mapping}, topic_pubid:{self.topic_to_publishers_id_mapping}')
+
+    # Send an updated state to discovery replicas
+    self.mw_obj.publish_discovery_update()
+
+    return
+  
+
+  ########################################
+  # process_brokers_child_trigger
+  #
+  # Function that is called whenever the 
+  # children of /brokers node change
+  ########################################
+  def process_brokers_child_trigger(self, current_children):
+    if (len(current_children) == 0):
+      self.logger.info(f'No primary broker!')
+      if (self.broker_leader != None):
+        # unsubscribe and delete from state
+        # Send an unsubscribe update to subscribers
+        unsub_update = {
+          'addr': self.broker_leader['addr'],
+          'port': self.broker_leader['port']
+        }
+        self.mw_obj.publish_unsub_update(unsub_update)
+
+        # Remove the broker from the state
+        old_broker_name = self.broker_leader['name']
+        self.registered_brokers.remove(old_broker_name)
+        del self.broker_id_to_ipport_mapping[old_broker_name]
+
+        self.broker_leader = None
+
+        # Send a state update to other discoveries
+        self.mw_obj.publish_discovery_update()
+      return
+    
+    # Get the leader info
+    # Get data from the node
+    data_bytes, _ = self.zk_client.get('/brokers/leader')
+    data_dict = json.loads(data_bytes.decode('utf-8'))
+    self.logger.info(f'Current broker leader: {data_dict}')
+
+    # Check old info and send an unsubscribe notification if the leader is new
+    if (self.broker_leader == None or self.broker_leader['addr'] != data_dict['addr']):
+      if (self.broker_leader != None):
+        # Send an unsubscribe update to subscribers
+        unsub_update = {
+          'addr': self.broker_leader['addr'],
+          'port': self.broker_leader['port']
+        }
+        self.mw_obj.publish_unsub_update(unsub_update)
+        self.logger.info(f'Unsubscribed from old broker: {self.broker_leader}')
+
+        # Remove the broker from the state
+        old_broker_name = self.broker_leader['name']
+        self.registered_brokers.remove(old_broker_name)
+        del self.broker_id_to_ipport_mapping[old_broker_name]
+
+        # Send a state update to other discoveries
+        self.mw_obj.publish_discovery_update()
+      
+      # Publish a sub update, notify of the new broker
+      # If you need any of these topics, subscribe to this 
+      self.logger.info(f'Sending a SUB update to subscribe to new broker: {data_dict}')
+      sub_update = {
+        'update_type': 'broker',
+        'addr': data_dict['addr'],
+        'port': data_dict['port'],
+        'topics': []
+      }
+      self.mw_obj.publish_sub_update(sub_update)
+
+    # Update the broker leader in the discovery
+    self.logger.info(f"New primary broker: {data_dict}")
+    self.broker_leader = data_dict
+    return
+
+
 
   ########################################
   # driver program
@@ -141,7 +357,7 @@ class DiscoveryAppln ():
     ''' Driver program for Discovery Service'''
 
     try:
-      self.logger.info ("DiscoveryAppln::driver")
+      self.logger.debug ("DiscoveryAppln::driver")
 
       # dump our contents (debugging purposes)
       self.dump ()
@@ -164,9 +380,9 @@ class DiscoveryAppln ():
       # None or some large value, but if we want to send a request ourselves right away,
       # we set timeout is zero.
       #
-      self.mw_obj.event_loop (timeout=self.timeout)  # start the event loop
+      self.mw_obj.event_loop (timeout=None)  # start the event loop
       
-      self.logger.info ("DiscoveryAppln::driver completed")
+      self.logger.debug ("DiscoveryAppln::driver completed")
       
     except Exception as e:
       raise e
@@ -209,6 +425,18 @@ class DiscoveryAppln ():
           
           # respond to the service that made the request
           self.mw_obj.respond_to_register_request(framesRcvd, True, "", timestamp_sent)
+
+          # Notify subscribers and brokers of a new publisher
+          if (self.lookup == 'ZooKeeper'):
+            # Publish a sub update
+            # If you need any of these topics, subscribe to this 
+            sub_update = {
+              'update_type': 'pub',
+              'addr': registrant_ip,
+              'port': registrant_port,
+              'topics': list(topiclist)
+            }
+            self.mw_obj.publish_sub_update(sub_update)
       
       elif (register_req.role == discovery_pb2.ROLE_SUBSCRIBER):
         # A SUBSCRIBER sent a request to register
@@ -241,6 +469,11 @@ class DiscoveryAppln ():
         self.logger.debug ("DiscoveryAppln::handle_register_request - Register Request with unknown role has been received, abort")
         raise ValueError ("DiscoveryAppln::handle_register_request - Register Request with unknown role has been received, abort")
 
+
+      if (self.lookup == 'ZooKeeper'):
+        # Send an update of state on pub socket
+        self.mw_obj.publish_discovery_update()
+
       return None
 
     except Exception as e:
@@ -251,7 +484,13 @@ class DiscoveryAppln ():
   # handle_isready_request
   ########################################
   def handle_isready_request(self, isready_request_body, framesRcvd, timestamp_sent):
-    if (self.lookup == 'DHT'):
+    if (self.lookup == 'ZooKeeper'):
+      # When using Zookeeper, the system is always ready
+      # Send the response with True 
+      self.mw_obj.respond_to_isready_request(True, framesRcvd, timestamp_sent)
+      return None
+    
+    elif (self.lookup == 'DHT'):
       dht_payload = isready_request_body.dht_payload
       visited_nodes_set = set(dht_payload.visited_nodes)
       registered_subs_set = set(dht_payload.registered_subs)
@@ -265,17 +504,17 @@ class DiscoveryAppln ():
 
         areBrokersReady = (self.dissemination != 'Broker' or (self.dissemination == 'Broker' and len(registered_brokers_set) != 0))
 
-        self.logger.info("areBrokersReady = %s", str(areBrokersReady))
+        self.logger.debug("areBrokersReady = %s", str(areBrokersReady))
 
         isSystemReady = areSubscribersReady and arePublishersReady and areBrokersReady
 
         # send the response with the result
         self.mw_obj.respond_to_isready_request(isSystemReady, framesRcvd, timestamp_sent)
 
-        self.logger.info(f"IS_READY, producers: {str(registered_pubs_set)} ")
-        self.logger.info(f"IS_READY, subscribers: {str(registered_subs_set)} ")
-        self.logger.info(f"IS_READY, brokers: {str(registered_brokers_set)} ")
-        self.logger.info(f"IS_READY, visited nodes: {str(visited_nodes_set)} ")
+        self.logger.debug(f"IS_READY, producers: {str(registered_pubs_set)} ")
+        self.logger.debug(f"IS_READY, subscribers: {str(registered_subs_set)} ")
+        self.logger.debug(f"IS_READY, brokers: {str(registered_brokers_set)} ")
+        self.logger.debug(f"IS_READY, visited nodes: {str(visited_nodes_set)} ")
 
         return None
 
@@ -308,7 +547,7 @@ class DiscoveryAppln ():
 
       areBrokersReady = (self.dissemination != 'Broker' or (self.dissemination == 'Broker' and len(self.registered_brokers) != 0))
 
-      self.logger.info("areBrokersReady = %s", str(areBrokersReady))
+      self.logger.debug("areBrokersReady = %s", str(areBrokersReady))
 
       isSystemReady = areSubscribersReady and arePublishersReady and areBrokersReady
 
@@ -359,10 +598,11 @@ class DiscoveryAppln ():
       # Now if we visited all nodes, we just send it back
       # If we have more nodes to visit, we forward the lookup request further
 
-      if(self.lookup != 'DHT'):
+      if(self.lookup == 'Centralized' or self.lookup == 'ZooKeeper'):
         # Send them to the requester
-        self.mw_obj.respond_to_lookup_request(socketsToConnectTo, all, framesRcvd, timestamp_sent)    
-      else:
+        self.mw_obj.respond_to_lookup_request(socketsToConnectTo, all, framesRcvd, timestamp_sent)
+      
+      elif (self.lookup == 'DHT'):
         # check if we visited all nodes
         visited_nodes_set = set(lookup_req.visited_nodes)
         already_added_sockets = set(lookup_req.sockets_to_connect_to)
@@ -380,6 +620,20 @@ class DiscoveryAppln ():
 
     except Exception as e:
       raise e
+    
+  ########################################
+  # update_state
+  ########################################
+  def update_state(self, new_state):
+    self.registered_publishers = set(new_state['registered_publishers'])
+    self.publisher_id_to_ipport_mapping = new_state['publisher_id_to_ipport_mapping']
+    self.topic_to_publishers_id_mapping = new_state['topic_to_publishers_id_mapping']
+    self.registered_subscribers = set(new_state['registered_subscribers'])
+    self.registered_brokers = set(new_state['registered_brokers'])
+    self.broker_id_to_ipport_mapping = new_state['broker_id_to_ipport_mapping']
+    self.logger.info("Updated all of the state")
+
+
 
 
   def stop_appln(self):
@@ -442,9 +696,20 @@ def parseCmdLineArgs ():
   # name of the node
   parser.add_argument ("-n", "--name", type=str, default='discovery', help="Name of the discovery node")
 
-  # port used by the discovery node
+  # address of discovery node
+  parser.add_argument("-a", "--addr", default='localhost', help="Address of the Discovery instance")
+
+  # Main port used by the discovery node
   parser.add_argument("-p", "--port", type=int, default=8888, help="Port used by the discovery node")
+
+  # Subscription port used by the discovery node
+  parser.add_argument("-s", "--sub_port", type=int, default=8888, help="Port used by the discovery node for disseminating sync information to other discoveries, brokers, subs")
   
+  # address of Zookeeper
+  parser.add_argument("-z", "--zookeeper", default='localhost:2181', help="Address of the Zookeeper instance")
+
+  
+
   return parser.parse_args()
 
 
@@ -457,7 +722,7 @@ def parseCmdLineArgs ():
 def main ():
   try:
     # obtain a system wide logger and initialize it to debug level to begin with
-    logging.info ("Main - acquire a child logger and then log messages in the child")
+    logging.debug ("Main - acquire a child logger and then log messages in the child")
     logger = logging.getLogger ("DiscoveryAppln")
     
     # first parse the arguments

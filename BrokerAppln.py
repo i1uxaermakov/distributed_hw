@@ -37,6 +37,11 @@ from CS6381_MW import discovery_pb2
 # import any other packages you need.
 from enum import Enum  # for an enumeration we are using to describe what state we are in
 
+# Objects to interact with Zookeeper
+from kazoo.client import KazooClient
+from kazoo.exceptions import NodeExistsError
+import json
+
 
 ##################################
 #       BrokerAppln class
@@ -67,6 +72,16 @@ class BrokerAppln ():
     self.logger = logger  # internal logger for print statements
     self.timeout = None 
 
+    # Zookeeper-related variables
+    self.zk_client = None
+    self.discovery = None
+    self.discovery_leader_addr = None 
+    self.discovery_leader_port = None
+    self.discovery_leader_sync_port = None
+    self.addr = None
+    self.port = None
+    self.zk_am_broker_leader = False
+
   ########################################
   # configure/initialize
   ########################################
@@ -83,6 +98,8 @@ class BrokerAppln ():
       # initialize our variables
       self.name = args.name # our name
       self.timeout = args.timeout * 1000 # timeout for receiving data when subscribed in ms
+      self.addr = args.addr
+      self.port = args.port
 
       # Now, get the configuration object
       self.logger.debug ("BrokerAppln::configure - parsing config.ini")
@@ -95,20 +112,157 @@ class BrokerAppln ():
       # everything
       self.logger.debug ("BrokerAppln::configure - initialize the middleware object")
       self.mw_obj = BrokerMW (self.logger)
-
-      # First ask our middleware to keep a handle to us to make upcalls.
-      # This is related to upcalls. By passing a pointer to ourselves, the
-      # middleware will keep track of it and any time something must
-      # be handled by the application level, invoke an upcall.
-      self.logger.debug ("BrokerAppln::driver - upcall handle")
       self.mw_obj.set_upcall_handle (self)
-
       self.mw_obj.configure (args) # pass remainder of the args to the m/w object
+
+      # Connect to Zookeeper to establish connection with Primary Discovery
+      if(self.lookup == 'ZooKeeper'):
+        self.zookeeper_addr = args.zookeeper
+        self.zk_client = KazooClient(hosts=self.zookeeper_addr)
+        self.zk_client.start()
+
+        # Do an election for primary broker
+        # If not leader, keep spinning here until you are a leader
+        # Then proceed to getting discovery, registering, lookup, etc.
+        self.conduct_broker_leader_election()
+
+        while not self.zk_am_broker_leader:
+          time.sleep(0.5)
+
+        # Get discovery Service
+        self.set_up_connection_to_discovery_leader()
+
+        # Set up a watch for the primary discovery
+        self.set_up_watch_for_primary_discovery()
       
       self.logger.info ("BrokerAppln::configure - configuration complete")
       
     except Exception as e:
       raise e
+
+  ########################################
+  # conduct_broker_leader_election
+  ########################################
+  def conduct_broker_leader_election(self):
+    self.zk_am_broker_leader = self.register_broker_with_zookeeper()
+
+    # Start a children watch on /discovery
+    @self.zk_client.ChildrenWatch('/brokers')
+    def watch_discovery_children(children):
+      if(len(children) == 0):
+        # if we get triggered, this means a discovery node has died, so we need to elect a new discovery leader and subscribe to it if we are not the leader
+        self.zk_am_broker_leader = self.register_broker_with_zookeeper()
+
+    return
+  
+
+  ########################################
+  # register_broker_with_zookeeper
+  ########################################
+  def register_broker_with_zookeeper(self):
+    path = '/brokers/leader'
+
+    # Create an ephemeral node for Discovery leader
+    try:
+      # Data to store in the node
+      data_dict = {
+        'addr': self.addr,
+        'port': self.port,
+        'name': self.name
+      }
+      data_bytes = json.dumps(data_dict).encode('utf-8')
+
+      # Try to create the ephemeral node
+      self.zk_client.create(path, ephemeral=True, makepath=True, value=data_bytes)
+      self.logger.info ("Ephemeral /discovery/leader successfully created, we are a leader")
+      return True
+    
+    except NodeExistsError:
+      # Handle the case where the node already exists
+      self.logger.info ("Ephemeral /discovery/leader node already exists, we are NOT a leader")
+
+      return False
+
+
+  ########################################
+  # set_up_connection_to_discovery_leader
+  ########################################
+  def set_up_connection_to_discovery_leader(self):
+    # If exists, get value, set up watch
+    # If doesn't exist, spin until it is created
+    discovery_leader_path = '/discovery/leader'
+
+    # spin while we are waiting for primary discovery to appear
+    while True:
+      if(self.zk_client.exists(discovery_leader_path)):
+        # Retrieve info about the leader
+        leader_info = self.get_data_about_discovery_leader()
+
+        # update discovery leader info
+        self.discovery_leader_addr = leader_info['addr']
+        self.discovery_leader_port = leader_info['port']
+        self.discovery_leader_sync_port = leader_info['sub_port']
+        
+        # Connect to the new discovery and subscribe for updates from it
+        self.mw_obj.connect_to_discovery_leader(leader_info['addr'], leader_info['port'], leader_info['sub_port'])
+        break
+
+      else:
+        # Node does not exist yet, so we wait
+        time.sleep(1)
+
+
+  ########################################
+  # set_up_watch_for_primary_discovery
+  ########################################
+  def set_up_watch_for_primary_discovery(self):
+    # Set up a watch for discovery leader to get notified when it changes
+    @self.zk_client.ChildrenWatch('/discovery')
+    def watch_discovery_children(children):
+      # No children means the discovery died, so we can disconnect from the old one
+      if (len(children) == 0):
+        # Disconnect from the old one if there is an old one
+        if(self.discovery_leader_addr != None):
+          self.mw_obj.disconnect_from_old_discovery_leader(self.discovery_leader_addr, self.discovery_leader_port, self.discovery_leader_sync_port)
+
+        # Update the info about the discovery leader
+        self.discovery_leader_addr = None
+        self.discovery_leader_port = None
+        self.discovery_leader_sync_port = None
+
+        return
+
+      # There is a child, so there is a primary discovery
+      else:
+        # Retrieve info about the leader
+        leader_info = self.get_data_about_discovery_leader()
+
+        # If the leader has changed, connect to the new leader
+        if(leader_info['addr'] != self.discovery_leader_addr):
+        
+          # Disconnect from old one if we are still connected (i.e. )
+          if(self.discovery_leader_addr != None):
+            self.mw_obj.disconnect_from_old_discovery_leader(self.discovery_leader_addr, self.discovery_leader_port, self.discovery_leader_sync_port)
+          
+          # Connect to the new discovery and subscribe for updates from it
+          self.mw_obj.connect_to_discovery_leader(leader_info['addr'], leader_info['port'], leader_info['sub_port'])
+
+          # Update info about discovery leader
+          self.discovery_leader_addr = leader_info['addr'] 
+          self.discovery_leader_port = leader_info['port']
+          self.discovery_leader_sync_port = leader_info['sub_port']
+      return
+
+
+  ########################################
+  # get_data_about_discovery_leader
+  ########################################
+  def get_data_about_discovery_leader(self):
+    disc_leader_data, _ = self.zk_client.get('/discovery/leader')
+    data_dict = json.loads(disc_leader_data.decode('utf-8'))
+    return data_dict
+
+
 
   ########################################
   # driver program
@@ -309,7 +463,7 @@ class BrokerAppln ():
       
       # Set the timeout to standard timeout for receiving data
       # If we don't receive data for that many seconds, we bring the broker down
-      return self.timeout
+      return None
     
     except Exception as e:
       raise e
@@ -358,6 +512,9 @@ def parseCmdLineArgs ():
 
   #dht_json_path
   parser.add_argument ("-j", "--dht_json_path", type=str, default='dht.json', help="Info about dht nodes in the ring.")
+
+  # address of Zookeeper
+  parser.add_argument("-z", "--zookeeper", default='localhost:2181', help="Address of the Zookeeper instance")
   
   return parser.parse_args()
 

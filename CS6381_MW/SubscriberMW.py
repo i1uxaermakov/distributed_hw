@@ -65,6 +65,13 @@ class SubscriberMW ():
     self.dht_json_path = None # path to DHT file
     self.dht_num = None
 
+    # Zookeeper-related fields
+    self.disc_sub_socket = None # Socket for subscribing to updates from discovery
+    # self.discovery_leader_addr = None 
+    # self.discovery_leader_port = None
+    # self.discovery_leader_sync_port = None
+    self.ipports_connected_to = set()
+
   ########################################
   # configure/initialize
   ########################################
@@ -73,7 +80,7 @@ class SubscriberMW ():
 
     try:
       # Here we initialize any internal variables
-      self.logger.info ("SubscriberMW::configure")
+      self.logger.debug ("SubscriberMW::configure")
 
       self.port = args.port
       self.dht_json_path = args.dht_json_path
@@ -111,17 +118,31 @@ class SubscriberMW ():
         self.dht_num = dht_nodes_number
         random_index = random.randint(0, dht_nodes_number-1)
         randomly_chosen_dht = dht_file['dht'][random_index]
-        self.logger.info (f"SubscriberMW::configure - connect to DHT Discovery service: {randomly_chosen_dht}")
+        self.logger.debug (f"SubscriberMW::configure - connect to DHT Discovery service: {randomly_chosen_dht}")
         connect_str = "tcp://" + randomly_chosen_dht['IP'] + ":" + str(randomly_chosen_dht['port'])
-      else:
-        connect_str = "tcp://" + args.discovery
+        # connect to discovery
+        self.req.connect (connect_str)
       
-      # connect to discovery
-      self.req.connect (connect_str)
+      elif (self.upcall_obj.lookup == "Centralized"):
+        connect_str = "tcp://" + args.discovery
+        # connect to discovery
+        self.req.connect (connect_str)
+      
+      elif (self.upcall_obj.lookup == "ZooKeeper"):
+        # Set up a SUB socket to later connect to a discovery
+        self.disc_sub_socket = context.socket (zmq.SUB)
+        # Add the sub socket to the poller
+        self.poller.register (self.disc_sub_socket, zmq.POLLIN)
+        
+        # Make the subscriber listen for topics sub and unsub
+        # sub is for used for notifying subs of new entities they need to subscribe to
+        # unsub 
+        self.disc_sub_socket.setsockopt (zmq.SUBSCRIBE, bytes('sub', 'utf-8'))
+        self.disc_sub_socket.setsockopt (zmq.SUBSCRIBE, bytes('unsub', 'utf-8'))
       
       # We will be connecting to the publishers once we receive data about them
       
-      self.logger.info ("SubscriberMW::configure completed")
+      self.logger.debug ("SubscriberMW::configure completed")
 
     except Exception as e:
       raise e
@@ -155,8 +176,12 @@ class SubscriberMW ():
           # handle the incoming reply from remote entity and return the result
           timeout = self.handle_bytes_on_req_socket()
 
+        elif self.disc_sub_socket in events:
+          # Received an update from the discovery leader
+          timeout = self.handle_sync_update_from_disc_leader()
+
         elif self.sub in events:
-            timeout = self.handle_bytes_on_sub_socket()
+          timeout = self.handle_bytes_on_sub_socket()
           
         else:
           raise Exception ("Unknown event after poll")
@@ -171,7 +196,7 @@ class SubscriberMW ():
   def handle_bytes_on_req_socket (self):
     # REQ socket is only used to talk to Discovery Service, so we can safely convert the bytes into a DiscoveryRespo data structure
     try:
-      self.logger.info ("SubscriberMW::handle_bytes_on_req_socket")
+      self.logger.debug ("SubscriberMW::handle_bytes_on_req_socket")
 
       # let us first receive all the bytes
       bytesRcvd = self.req.recv ()
@@ -206,7 +231,7 @@ class SubscriberMW ():
   # handle_bytes_on_sub_socket
   #################################################################
   def handle_bytes_on_sub_socket(self):
-    self.logger.info ("SubscriberMW::handle_bytes_on_sub_socket")
+    self.logger.debug ("SubscriberMW::handle_bytes_on_sub_socket")
     data_in_bytes = self.sub.recv()
     data_string = data_in_bytes.decode()
 
@@ -227,7 +252,7 @@ class SubscriberMW ():
     ''' register the appln with the discovery service '''
 
     try:
-      self.logger.info ("SubscriberMW::register")
+      self.logger.debug ("SubscriberMW::register")
 
       # as part of registration with the discovery service, we send
       # what role we are playing, the list of topics we are publishing,
@@ -271,7 +296,7 @@ class SubscriberMW ():
       self.req.send (buf2send)  # we use the "send" method of ZMQ that sends the bytes
 
       # now go to our event loop to receive a response to this request
-      self.logger.info ("SubscriberMW::register - sent register message and now now wait for reply")
+      self.logger.debug ("SubscriberMW::register - sent register message and now now wait for reply")
     
     except Exception as e:
       raise e
@@ -288,7 +313,7 @@ class SubscriberMW ():
     ''' register the appln with the discovery service '''
 
     try:
-      self.logger.info ("SubscriberMW::is_ready")
+      self.logger.debug ("SubscriberMW::is_ready")
 
       # we do a similar kind of serialization as we did in the register
       # message but much simpler as the message format is very simple.
@@ -322,7 +347,7 @@ class SubscriberMW ():
       self.req.send (buf2send)  # we use the "send" method of ZMQ that sends the bytes
       
       # now go to our event loop to receive a response to this request
-      self.logger.info ("SubscriberMW::is_ready - request sent and now wait for reply")
+      self.logger.debug ("SubscriberMW::is_ready - request sent and now wait for reply")
       
     except Exception as e:
       raise e
@@ -336,7 +361,7 @@ class SubscriberMW ():
     ''' send_lookup_request '''
 
     try:
-      self.logger.info ("SubscriberMW::lookup")
+      self.logger.debug ("SubscriberMW::lookup")
 
       
       # Next build a RegisterReq message
@@ -365,7 +390,7 @@ class SubscriberMW ():
       self.req.send (buf2send)  # we use the "send" method of ZMQ that sends the bytes
 
       # now go to our event loop to receive a response to this request
-      self.logger.info ("SubscriberMW::lookup - sent lookup message and now wait for reply")
+      self.logger.debug ("SubscriberMW::lookup - sent lookup message and now wait for reply")
     
     except Exception as e:
       raise e
@@ -378,14 +403,14 @@ class SubscriberMW ():
     ''' connect_to_publishers '''
 
     try:
-      self.logger.info ("SubscriberMW::connect_to_publishers")
+      self.logger.debug ("SubscriberMW::connect_to_publishers")
 
       # connect to every publisher we are interested in
       for ipport in addressesToConnectTo:
         self.sub.connect ("tcp://" + ipport)
+        self.ipports_connected_to.add(ipport)
 
-      self.logger.info ("SubscriberMW::connect_to_publishers – Connected to all of them!")
-      self.logger.info("SubscriberMW::connect_to_publishers – Connected to the following addresses: %s", str(addressesToConnectTo))
+      self.logger.info("MW: Connected to the following addresses: %s", str(addressesToConnectTo))
     
     except Exception as e:
       raise e           
@@ -398,13 +423,13 @@ class SubscriberMW ():
     ''' subscribe_to_topics '''
 
     try:
-      self.logger.info ("SubscriberMW::subscribe_to_topics")
+      self.logger.debug ("SubscriberMW::subscribe_to_topics")
 
       # subscribe to the topics by setting the socket options
       for topic in topiclist:
         self.sub.setsockopt (zmq.SUBSCRIBE, bytes(topic, 'utf-8'))
 
-      self.logger.info("SubscriberMW::subscribe_to_topics – Subscribed to the following topics: %s", str(topiclist))
+      self.logger.debug("SubscriberMW::subscribe_to_topics – Subscribed to the following topics: %s", str(topiclist))
     
     except Exception as e:
       raise e   
@@ -429,3 +454,91 @@ class SubscriberMW ():
   def disable_event_loop (self):
     ''' disable event loop '''
     self.handle_events = False
+
+
+  ########################################
+  # connect_to_discovery_leader
+  #
+  # Connect to discovery leader on REQ and SUB sockets
+  ########################################
+  def connect_to_discovery_leader(self, disc_addr, disc_port, disc_sync_port):
+    # Connect the req socket
+    self.req.connect('tcp://' + disc_addr + ':' + str(disc_port))
+
+    # Subscribe for updates
+    self.disc_sub_socket.connect('tcp://' + disc_addr + ':' + str(disc_sync_port))
+
+    return
+
+
+  ########################################
+  # disconnect_from_old_discovery_leader
+  #
+  # Disconnect from discovery leader on REQ and SUB sockets
+  ########################################
+  def disconnect_from_old_discovery_leader(self, old_addr, old_port, old_sub_port):
+    # Disconnect REQ socket
+    self.req.disconnect('tcp://' + old_addr + ':' + str(old_port))
+    # Disconnect SUB socket
+    self.disc_sub_socket.disconnect('tcp://' + old_addr + ':' + str(old_sub_port))
+    return
+  
+  ########################################
+  # handle_sync_update_from_disc_leader
+  #
+  # Handle an update received from the discovery leader
+  # Subscribe to new entities or disconnect from the ones that died
+  ########################################
+  def handle_sync_update_from_disc_leader(self):
+    bytesRcvd = self.disc_sub_socket.recv()
+    bytesRcvd = bytesRcvd.decode('utf-8')
+
+    # determine type of message (sub or unsub) and get the messsage itself
+    beginning_of_payload = (bytesRcvd.find(':') + 1)
+    update_type = bytesRcvd[:(beginning_of_payload-1)]
+    string_received = bytesRcvd[beginning_of_payload:]
+    data_dict = json.loads(string_received)
+
+    ipport = data_dict['addr'] + ':' + str(data_dict['port'])
+
+    # New broker or pub has joined
+    if (update_type == 'sub'):
+      self.logger.info("Processing a SUB update")
+      # New broker has joined
+      if(data_dict['update_type'] == 'broker'):
+        # Connect to the new broker if we are using the Broker dissemination
+        if(self.upcall_obj.dissemination == 'Broker'):
+          self.logger.info(f"Subscribing to a new broker {ipport}")
+          self.connect_to_publishers([ipport])
+      
+      # A new publisher has joined
+      elif (data_dict['update_type'] == 'pub'):
+        # Subscribe to it only if using direct dissemination approach
+        if(self.upcall_obj.dissemination == 'Direct'):
+          # Subscribe only if the new publisher is publishing on the topics we are interested in
+          if(self.list1_contains_an_element_from_list2(data_dict['topics'], self.upcall_obj.topiclist)):
+            self.logger.info("Subscribing to a new publisher")
+            self.connect_to_publishers([ipport])
+
+    # Broker or pub has died
+    elif(update_type == 'unsub'):
+      self.logger.info("Processing a UNSUB update")
+      # unsubscribe if we were subscribed
+      if (ipport in self.ipports_connected_to):
+        self.sub.disconnect('tcp://' + ipport)
+        self.ipports_connected_to.remove(ipport)
+        self.logger.info(f"Disconnected from {ipport}")
+
+    return None
+  
+
+  ########################################
+  # list1_contains_an_element_from_list2
+  #
+  # Returns true if list1 contains any elements from list 2
+  ########################################
+  def list1_contains_an_element_from_list2(self, list1, list2):
+    for item in list2:
+      if item in list1:
+        return True
+    return False

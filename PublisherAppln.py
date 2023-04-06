@@ -63,6 +63,11 @@ from CS6381_MW import discovery_pb2
 # import any other packages you need.
 from enum import Enum  # for an enumeration we are using to describe what state we are in
 
+# Objects to interact with Zookeeper
+from kazoo.client import KazooClient
+from kazoo.exceptions import NodeExistsError
+import json
+
 ##################################
 #       PublisherAppln class
 ##################################
@@ -100,6 +105,15 @@ class PublisherAppln ():
     self.pub_num = None   # number of publishers in the system
     self.sub_num = None   # number of subscribers in the system
 
+    # Zookeeper-related variables
+    self.zk_client = None
+    self.discovery = None
+    self.discovery_leader_addr = None 
+    self.discovery_leader_port = None
+    self.addr = None
+    self.port = None
+    
+
   ########################################
   # configure/initialize
   ########################################
@@ -121,6 +135,8 @@ class PublisherAppln ():
       self.frequency = args.frequency # frequency with which topics are disseminated
       self.num_topics = args.num_topics  # total num of topics we publish
       self.experiment_name = args.experiment_name
+      self.addr = args.addr
+      self.port = args.port
 
       # Now, get the configuration object
       self.logger.debug ("PublisherAppln::configure - parsing config.ini")
@@ -148,11 +164,96 @@ class PublisherAppln ():
 
       # pass remainder of the args to the m/w object
       self.mw_obj.configure (args) 
+
+
+      # Connect to Zookeeper to establish connection with Primary Discovery
+      if(self.lookup == 'ZooKeeper'):
+        self.zookeeper_addr = args.zookeeper
+        self.zk_client = KazooClient(hosts=self.zookeeper_addr)
+        self.zk_client.start()
+        
+        # Create a node for yourself /pubs/%name%
+        self.create_pub_node()
+
+        # SETUP OF DISCOVERY SERVICE
+        
+
+        # Set up a watch for discovery leader to get notified when it changes
+        @self.zk_client.ChildrenWatch('/discovery')
+        def watch_discovery_children(children):
+          # No children means the discovery died, so we can disconnect from the old one
+          if (len(children) == 0):
+            # Disconnect from the old one if there is an old one
+            if(self.discovery_leader_addr != None):
+              self.mw_obj.disconnect_from_old_discovery_leader(self.discovery_leader_addr, self.discovery_leader_port)
+
+            # Update the info about the discovery leader
+            self.discovery_leader_addr = None
+            self.discovery_leader_port = None
+
+            return
+
+          # There is a child, so there is a primary discovery
+          else:
+            # Retrieve info about the leader
+            leader_info = self.get_data_about_discovery_leader()
+
+            # If the leader has changed, connect to the new leader
+            if(leader_info['addr'] != self.discovery_leader_addr):
+            
+              # Disconnect from old one if we are still connected (i.e. )
+              if(self.discovery_leader_addr != None):
+                self.mw_obj.disconnect_from_old_discovery_leader(self.discovery_leader_addr, self.discovery_leader_port)
+              
+              # Connect to the new discovery and subscribe for updates from it
+              self.mw_obj.connect_to_discovery_leader(leader_info['addr'], leader_info['port'])
+
+              # Update info about discovery leader
+              self.discovery_leader_addr = leader_info['addr'] 
+              self.discovery_leader_port = leader_info['port']
+          return
+        
+
+      # If using a Centralized Discovery lookup
+      else:
+        self.discovery = args.discovery
+      
       
       self.logger.info ("PublisherAppln::configure - configuration complete")
       
     except Exception as e:
       raise e
+
+
+  ########################################
+  # create_pub_node
+  ########################################
+  def create_pub_node(self):
+    my_pub_node_path = '/pubs/' + self.name
+    # Data to store in the node
+    data_dict = {
+      'addr': self.addr,
+      'port': self.port,
+      'name': self.name
+    }
+    data_bytes = json.dumps(data_dict).encode('utf-8')
+
+    # Create a pubs node for yourself
+    self.zk_client.create(my_pub_node_path, ephemeral=True, makepath=True, value=data_bytes)
+    return
+
+
+
+  ########################################
+  # get_data_about_discovery_leader
+  ########################################
+  def get_data_about_discovery_leader(self):
+    disc_leader_data, _ = self.zk_client.get('/discovery/leader')
+    data_dict = json.loads(disc_leader_data.decode('utf-8'))
+    return data_dict
+
+
+
 
   ########################################
   # driver program
@@ -487,6 +588,9 @@ def parseCmdLineArgs ():
   parser.add_argument("-P", "--publishers", type=int, default=2, help="Number of publishers")
 
   parser.add_argument("-S", "--subscribers", type=int, default=2, help="Number of subscribers")
+
+  # address of Zookeeper
+  parser.add_argument("-z", "--zookeeper", default='localhost:2181', help="Address of the Zookeeper instance")
   
   return parser.parse_args()
 

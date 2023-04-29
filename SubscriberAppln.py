@@ -37,6 +37,9 @@ import logging # for logging. Use it in place of print statements.
 import ast # for working with subsrption data (converting it back to dictionary)
 import mysql.connector # for working with mysql for analytics
 
+# For choosing a history size per topic
+import random
+
 # Import our topic selector. Feel free to use alternate way to
 # get your topics of interest
 from topic_selector import TopicSelector
@@ -100,6 +103,9 @@ class SubscriberAppln ():
     self.discovery_leader_sync_port = None
     self.count_msg_rcvd = 0
 
+    # History-related variables
+    self.topic_to_history_size_wanted = {}
+
 
 
   ########################################
@@ -155,8 +161,13 @@ class SubscriberAppln ():
         self.zookeeper_addr = args.zookeeper
         self.zk_client = KazooClient(hosts=self.zookeeper_addr)
         self.zk_client.start()
-        
 
+        # Set up history wanted sizes
+        for topic in self.topiclist:
+          self.topic_to_history_size_wanted[topic] = random.randint(1, 5)
+        self.logger.info(f'History Sizes per topic: {str(self.topic_to_history_size_wanted)}')
+        
+        
         # If exists, get value, set up watch
         # If doesn't exist, set up a watch
         discovery_leader_path = '/discovery/leader'
@@ -529,25 +540,26 @@ class SubscriberAppln ():
   ########################################
   # handle receipt of subscription data 
   ########################################
-  def handle_receipt_of_subscription_data (self, string_received):
+  def handle_receipt_of_subscription_data (self, messages_array):
     ''' handle_receipt_of_subscription_data '''
 
     try:
       self.logger.debug ("SubscriberAppln::handle_receipt_of_subscription_data")
 
       # self.logger.info("RECEIVED DATA: %s", string_received)
-      beginning_of_payload = (string_received.find(':') + 1)
-      string_received = string_received[beginning_of_payload:]
+      # beginning_of_payload = (string_received.find(':') + 1)
+      # string_received = string_received[beginning_of_payload:]
 
       # save latency information locally so that it can be sent to the database later
-      data = ast.literal_eval(string_received)
+      data = ast.literal_eval(messages_array[-1])
+      # data = messages_array[-1]
       cur_timestamp = time.time()
       sent_timestamp = float(data['sent_timestamp'])
       latency = str(cur_timestamp - sent_timestamp)
 
 
       self.logger.info(f"RECEIVED DATA from {data['pubid']}")
-      self.count_msg_rcvd = self.count_msg_rcvd + 1
+      # self.count_msg_rcvd = self.count_msg_rcvd + 1
 
       # INSERT INTO latencies(latency_sec, frequency, num_topics, pub_num, sub_num, pub_id, sub_id, experiment_name) VALUES ();
       # self.latency_data.append((
@@ -561,17 +573,17 @@ class SubscriberAppln ():
       #   self.name, 
       #   data['exp_name']))
       
-      self.latency_data.append(cur_timestamp)
+      # self.latency_data.append(cur_timestamp)
       
-      if(self.count_msg_rcvd >= 20):
-        # Open a file in write mode
-        file = open(f"{self.name}_broker_disc.txt", "w+")
+      # if(self.count_msg_rcvd >= 20):
+      #   # Open a file in write mode
+      #   file = open(f"{self.name}_broker_disc.txt", "w+")
 
-        for tstmp in self.latency_data:
-          file.write(f"{str(tstmp)}\n")
+      #   for tstmp in self.latency_data:
+      #     file.write(f"{str(tstmp)}\n")
 
-        # Close the file
-        file.close()
+      #   # Close the file
+      #   file.close()
       
       # return standard timeout for subscription data
       # if we do not receive data for this many milliseconds, we finish application

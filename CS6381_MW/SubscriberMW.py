@@ -42,6 +42,8 @@ import zmq  # ZMQ sockets
 import json # for reading the dht.json file
 import random # for choosing a random DHT node to contact
 
+import ast # for working with subsrption data (converting it back to dictionary)
+
 # import serialization logic
 from CS6381_MW import discovery_pb2
 #from CS6381_MW import topic_pb2  # you will need this eventually
@@ -226,7 +228,8 @@ class SubscriberMW ():
     
     except Exception as e:
       raise e
-            
+
+
   #################################################################
   # handle_bytes_on_sub_socket
   #################################################################
@@ -234,8 +237,35 @@ class SubscriberMW ():
     self.logger.debug ("SubscriberMW::handle_bytes_on_sub_socket")
     data_in_bytes = self.sub.recv()
     data_string = data_in_bytes.decode()
+    
+    # Get the message and topic
+    beginning_of_payload = (data_string.find(':') + 1)
+    topic = data_string[:(beginning_of_payload-1)]
+    string_received = data_string[beginning_of_payload:]
 
-    timeout = self.upcall_obj.handle_receipt_of_subscription_data(data_string)
+    # Get the array of messages
+    array_of_messages = ast.literal_eval(string_received)
+
+    # Get the number of messages in the payload and the number of messages we want per topic
+    num_of_messages_wanted = self.upcall_obj.topic_to_history_size_wanted[topic]
+    num_of_messages_delivered = len(array_of_messages)
+
+    # Check if the number of messages we received suffices
+    if (num_of_messages_delivered >= num_of_messages_wanted):
+      # Get only the messages that we want
+      wanted_messages = array_of_messages[-num_of_messages_wanted:]
+
+      # Send them to the application
+      timeout = self.upcall_obj.handle_receipt_of_subscription_data(wanted_messages)
+
+      # log
+      self.logger.info(f"PROCESS A MSG: Rcvd {num_of_messages_delivered} msgs on topic {topic}, wanted {num_of_messages_wanted}")
+
+    else:
+      # log ignore
+      self.logger.info(f"IGNORE A MSG: Rcvd {num_of_messages_delivered} msgs on topic {topic}, wanted {num_of_messages_wanted}")
+      timeout = None
+
     return timeout
             
   ########################################

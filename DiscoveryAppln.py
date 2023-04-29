@@ -99,7 +99,11 @@ class DiscoveryAppln ():
     self.zk_am_leader = False
     self.addr = None
     self.sub_port = None
-    self.broker_leader = None
+    self.broker_leaders = {
+      'group1': None,
+      'group2': None,
+      'group3': None
+    }
     self.port = None
 
 
@@ -122,6 +126,13 @@ class DiscoveryAppln ():
       self.lookup = config["Discovery"]["Strategy"]
       self.dissemination = config["Dissemination"]["Strategy"]
       self.timeout = args.timeout * 1000 # timeout for receiving data when subscribed in ms
+
+      self.group_to_topics_mapping = {
+        'group1': config['GroupToTopicMapping']['group1'].split(','),
+        'group2': config['GroupToTopicMapping']['group2'].split(','),
+        'group3': config['GroupToTopicMapping']['group3'].split(',')
+      }
+      
 
       self.name = args.name
       self.expected_pub_num = args.publishers    # number of publishers in the system
@@ -285,69 +296,99 @@ class DiscoveryAppln ():
   # children of /brokers node change
   ########################################
   def process_brokers_child_trigger(self, current_children):
-    if (len(current_children) == 0):
-      self.logger.info(f'No primary broker!')
-      if (self.broker_leader != None):
-        # unsubscribe and delete from state
-        # Send an unsubscribe update to subscribers
-        unsub_update = {
-          'addr': self.broker_leader['addr'],
-          'port': self.broker_leader['port']
-        }
-        self.mw_obj.publish_unsub_update(unsub_update)
+    new_broker_leaders = {
+      'group1': None,
+      'group2': None,
+      'group3': None,
+    }
 
-        # Remove the broker from the state
-        old_broker_name = self.broker_leader['name']
-        self.registered_brokers.remove(old_broker_name)
-        del self.broker_id_to_ipport_mapping[old_broker_name]
+    # Each child is a leader within a group
+    for child in current_children:
+      # Get the info of the leader in the group
+      # Get data from the node
+      data_bytes, _ = self.zk_client.get('/brokers/' + child)
+      data_dict = json.loads(data_bytes.decode('utf-8'))
+      self.logger.info(f'Current broker leader: {data_dict}')
 
-        self.broker_leader = None
+      brokers_group = child
+      new_broker_leaders[brokers_group] = data_dict
 
-        # Send a state update to other discoveries
-        self.mw_obj.publish_discovery_update()
-      return
+    # Check if any of the leaders have changed, send appropriate sub and unsub notifications
+    self.check_if_group_leader_changed_and_send_notif('group1', new_broker_leaders)
+    self.check_if_group_leader_changed_and_send_notif('group2', new_broker_leaders)
+    self.check_if_group_leader_changed_and_send_notif('group3', new_broker_leaders)
+
+    # Update the state of broker leaders
+    self.broker_leaders = new_broker_leaders
     
-    # Get the leader info
-    # Get data from the node
-    data_bytes, _ = self.zk_client.get('/brokers/leader')
-    data_dict = json.loads(data_bytes.decode('utf-8'))
-    self.logger.info(f'Current broker leader: {data_dict}')
 
-    # Check old info and send an unsubscribe notification if the leader is new
-    if (self.broker_leader == None or self.broker_leader['addr'] != data_dict['addr']):
-      if (self.broker_leader != None):
-        # Send an unsubscribe update to subscribers
+  ########################################
+  # check_if_group_leader_changed_and_send_notif
+  # Also removes brokers from the local state if necessary
+  ########################################
+  def check_if_group_leader_changed_and_send_notif(self, group_name, new_broker_leaders):
+    # Check if group_name leader changed
+    if(self.broker_leaders[group_name]==None):
+      if(new_broker_leaders[group_name] != None):
+        # There was no broker, now there is one
+        # Issue a sub update
+        sub_update = {
+          'update_type': 'broker',
+          'addr': new_broker_leaders[group_name]['addr'],
+          'port': new_broker_leaders[group_name]['port'],
+          'topics': self.group_to_topics_mapping[group_name]
+        }
+        self.mw_obj.publish_sub_update(sub_update)
+
+    else:
+      # There was a broker
+      # It can either be the same (alive), dead, or new
+
+      if(new_broker_leaders[group_name] == None):
+        # New broker hasn't been chosen
+        # just send an unsub update
+        # Send an unsub update for old
         unsub_update = {
-          'addr': self.broker_leader['addr'],
-          'port': self.broker_leader['port']
+          'addr': self.broker_leaders[group_name]['addr'],
+          'port': self.broker_leaders[group_name]['port']
         }
         self.mw_obj.publish_unsub_update(unsub_update)
-        self.logger.info(f'Unsubscribed from old broker: {self.broker_leader}')
 
-        # Remove the broker from the state
-        old_broker_name = self.broker_leader['name']
+        # Remove from local state
+        old_broker_name = self.broker_leaders[group_name]['name']
         self.registered_brokers.remove(old_broker_name)
         del self.broker_id_to_ipport_mapping[old_broker_name]
-
-        # Send a state update to other discoveries
-        self.mw_obj.publish_discovery_update()
       
-      # Publish a sub update, notify of the new broker
-      # If you need any of these topics, subscribe to this 
-      self.logger.info(f'Sending a SUB update to subscribe to new broker: {data_dict}')
-      sub_update = {
-        'update_type': 'broker',
-        'addr': data_dict['addr'],
-        'port': data_dict['port'],
-        'topics': []
-      }
-      self.mw_obj.publish_sub_update(sub_update)
+      else:
+        # There was a broker and there is one right now
+        # Either same or new
+        if(self.broker_leaders[group_name]['name'] != new_broker_leaders[group_name]['name']):
+          # Broker has changed
+          # Send an unsub update for old
+          unsub_update = {
+            'addr': self.broker_leaders[group_name]['addr'],
+            'port': self.broker_leaders[group_name]['port']
+          }
+          self.mw_obj.publish_unsub_update(unsub_update)
 
-    # Update the broker leader in the discovery
-    self.logger.info(f"New primary broker: {data_dict}")
-    self.broker_leader = data_dict
+          # Remove from local state
+          old_broker_name = self.broker_leaders[group_name]['name']
+          self.registered_brokers.remove(old_broker_name)
+          del self.broker_id_to_ipport_mapping[old_broker_name]
+          
+          # Send a sub update for a new broker
+          sub_update = {
+            'update_type': 'broker',
+            'addr': new_broker_leaders[group_name]['addr'],
+            'port': new_broker_leaders[group_name]['port'],
+            'topics': self.group_to_topics_mapping[group_name]
+          }
+          self.mw_obj.publish_sub_update(sub_update)
+
+        else:
+          # Same broker as before, don't do anything
+          pass
     return
-
 
 
   ########################################
@@ -460,6 +501,7 @@ class DiscoveryAppln ():
           self.mw_obj.respond_to_register_request(framesRcvd, False, reason.format(broker_id = registrant_id), timestamp_sent)
         else:
           # Add broker to the list of brokers
+          # TODO
           self.registered_brokers.add(registrant_id)
           self.broker_id_to_ipport_mapping[registrant_id] = ip_port_pair
           self.mw_obj.respond_to_register_request(framesRcvd, True, "", timestamp_sent)
@@ -569,13 +611,23 @@ class DiscoveryAppln ():
       # Set of strings of ip:port to connect to in order to receive data from needed topics
       socketsToConnectTo = set()
       
-      # if disseminating through broker, we are returning the ip:port of a broker, no matter what the subscriber is interested in
       if(self.dissemination == 'Broker' and not all):
-        self.logger.info ("DiscoveryAppln::handle_lookup_pub_by_topics – disseminating through broker, returning broker's address")
-        if (len(self.registered_brokers) != 0):
-          brokerId = next(iter(self.registered_brokers))
-          broker_ip_port = self.broker_id_to_ipport_mapping[brokerId]
-          socketsToConnectTo.add(broker_ip_port)
+        if(lookup_req.requester == 'Broker'):
+          # Requested by broker, so we send back the publishers
+          # based on the group of the broker, we return the publishers that publish on their topics
+          self.logger.info ("Handling a lookup request by a broker")
+          for topic in lookup_req.topiclist:
+            if self.topic_to_publishers_id_mapping.get(topic) is not None:
+              for pub_id in self.topic_to_publishers_id_mapping.get(topic):
+                socketsToConnectTo.add(self.publisher_id_to_ipport_mapping[pub_id])
+
+        else:
+          # Requested by a subscriber, we send back the brokers they need to subscribe to
+          # return all brokers since the only registered brokers are going to be the leader ones
+          self.logger.info ("Handling a lookup request by a subscriber")
+          for broker_name in self.registered_brokers:
+            broker_ip_port = self.broker_id_to_ipport_mapping[broker_name]
+            socketsToConnectTo.add(broker_ip_port)
       
       # if disseminating directly, return ip:port of publishers that publish on those topics
       else:

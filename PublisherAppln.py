@@ -68,6 +68,9 @@ from kazoo.client import KazooClient
 from kazoo.exceptions import NodeExistsError
 import json
 
+# For choosing a history size per topic
+import random
+
 ##################################
 #       PublisherAppln class
 ##################################
@@ -112,6 +115,14 @@ class PublisherAppln ():
     self.discovery_leader_port = None
     self.addr = None
     self.port = None
+
+    # Variables for ownership strength
+    self.topic_to_strength_ownership = {}
+    self.am_leader_for_topic = {}
+
+    # Variables for history
+    self.topic_to_history_size = {}
+    self.topic_to_history_queue = {}
     
 
   ########################################
@@ -175,8 +186,11 @@ class PublisherAppln ():
         # Create a node for yourself /pubs/%name%
         self.create_pub_node()
 
-        # SETUP OF DISCOVERY SERVICE
-        
+        # Set up nodes and watches for ownership strength
+        self.create_topic_nodes_for_strength_ownership()
+
+        # Set up history parameters and queues
+        self.set_up_history_for_topics()
 
         # Set up a watch for discovery leader to get notified when it changes
         @self.zk_client.ChildrenWatch('/discovery')
@@ -224,6 +238,78 @@ class PublisherAppln ():
     except Exception as e:
       raise e
 
+
+
+  ########################################
+  # set_up_history_for_topics
+  ########################################
+  def set_up_history_for_topics(self):
+    for topic in self.topiclist:
+      # Choose the history size per topic
+      self.topic_to_history_size[topic] = self.generate_history_size_for_topic()
+
+      # Create a data structure to store last N messages
+      self.topic_to_history_queue[topic] = []
+
+    self.logger.info(f'History Sizes per topic: {str(self.topic_to_history_size)}')
+
+    return
+
+
+
+  ########################################
+  # create_topic_nodes_for_strength_ownership
+  ########################################
+  def create_topic_nodes_for_strength_ownership(self):
+    for topic in self.topiclist:
+      path_to_topic = '/topic/' + topic
+      # Ensure there is a node for the topic
+      self.zk_client.ensure_path(path_to_topic)
+
+      # Create a node for yourself
+      path_without_sequence = path_to_topic + '/' + self.name + '-'
+      new_node_path = self.zk_client.create(path_without_sequence, sequence=True, ephemeral=True, value=bytes(topic, 'utf-8'))
+      
+      # Get Sequence number assigned by zookeeper
+      sequence_number = int(new_node_path.replace(path_without_sequence, ""))
+      self.logger.info(f'Ownership Strength for topic {topic}: {sequence_number}')
+
+      # Assign strength ownership
+      self.topic_to_strength_ownership[topic] = sequence_number
+      self.am_leader_for_topic[topic] = False
+
+      # Set up a watch to get notified whenever there are changes
+      self.set_up_watch_for_topic_ownership_strength(path_to_topic, topic)
+
+    return
+  
+
+  ########################################
+  # set_up_watch_for_topic_ownership_strength
+  ########################################
+  def set_up_watch_for_topic_ownership_strength(self, path_to_topic, topic):
+    @self.zk_client.ChildrenWatch(path_to_topic)
+    def watch_children(children):
+      if(len(children) == 0):
+        return
+
+      # Find the lowest sequence number, that indicates who is the leader and should disseminate
+      min_node_sequence = 1000000
+      for child in children:
+        beginning_of_sequence = (child.find('-') + 1)
+        node_sequence_number = int(child[beginning_of_sequence:])
+        min_node_sequence = min(min_node_sequence, node_sequence_number)
+
+      self.logger.info(f"min_node_sequence: {min_node_sequence}")
+
+      # Check if our sequence number is the smallest
+      if(min_node_sequence == self.topic_to_strength_ownership[topic]):
+        # If so, we are the publisher with the highest ownership strength
+        self.logger.info(f"We became a leader for topic {topic}")
+        self.am_leader_for_topic[topic] = True
+
+      return
+    return
 
   ########################################
   # create_pub_node
@@ -351,7 +437,17 @@ class PublisherAppln ():
           # each iteration OR some subset of it. Please modify the logic accordingly.
           # Here, we choose to disseminate on all topics that we publish.  Also, we don't care
           # about their values. But in future assignments, this can change.
+          iter_diss_topics = []
           for topic in self.topiclist:
+
+            # Do not publish unless we are the leader for the topic (i.e. we are a publisher with the highest ownership strength)
+            if (not self.am_leader_for_topic[topic]):
+              continue
+            
+            # Array for logging purposes
+            # What topics we disseminated to on this iteration
+            iter_diss_topics.append(topic)
+
             # For now, we have chosen to send info in the form "topic name: topic value"
             # In later assignments, we should be using more complex encodings using
             # protobuf.  In fact, I am going to do this once my basic logic is working.
@@ -364,12 +460,28 @@ class PublisherAppln ():
               "sent_timestamp":str(time.time()),
               "exp_name": self.experiment_name
               })
-            self.mw_obj.disseminate (self.name, topic, dissemination_data)
-            self.logger.info ("Sent to topic: %s, data: %s", topic, dissemination_data)
+            
+
+            # Remove old messages for the topic from history
+            max_size = self.topic_to_history_size[topic]
+            while(len(self.topic_to_history_queue[topic]) > max_size-1):
+              # Remove first element
+              self.topic_to_history_queue[topic].pop(0)
+
+            # Add the data to the history for the topic
+            self.topic_to_history_queue[topic].append(dissemination_data)
+
+            # Send last N messages
+            self.mw_obj.disseminate (self.name, topic, self.topic_to_history_queue[topic])
+            
+            self.logger.debug ("Sent to topic: %s, data: %s", topic, dissemination_data)
+            #self.logger.info ("Sent to topic: %s", topic)
 
           # Now sleep for an interval of time to ensure we disseminate at the
           # frequency that was configured.
+          self.logger.info (f"Sent msgs to topics: {str(iter_diss_topics)}")
           time.sleep (1/float (self.frequency))  # ensure we get a floating point num
+          
 
         self.logger.debug ("PublisherAppln::invoke_operation - Dissemination completed")
 
@@ -523,6 +635,15 @@ class PublisherAppln ():
           self.logger.info("Publisher::save_dht_statistics - MySQL connection is closed")
 
     return
+
+
+  ########################################
+  # generate_history_size_for_topic
+  # Generate a random number from 1 to f
+  # Used for setting the history size 
+  ########################################
+  def generate_history_size_for_topic(self):
+    return random.randint(1, 5)
 
 
   ########################################

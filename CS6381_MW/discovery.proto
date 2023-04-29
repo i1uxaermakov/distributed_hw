@@ -45,6 +45,7 @@ message RegistrantInfo {
     string id = 1;  // name of the entity
     optional string addr = 2; // IP address (only for publisher)
     optional uint32 port = 3; // port number (only for publisher)
+    optional string group = 4; // Group of the broker, optional
 }
 
 // Likewise, instead of just comma separated list of topics, maybe a better way to send the topic list
@@ -104,6 +105,7 @@ message LookupPubByTopicReq
     repeated string topiclist = 1; // modify this appropriately
     repeated string visited_nodes = 2; // For DHT ring
     repeated string sockets_to_connect_to = 3; // For DHT ring, acts as a collector
+    optional string requester = 4; // Indicate from=broker when sending from broker
 }
 
 // Corresponding response to the lookupPubByTopic request

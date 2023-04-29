@@ -229,7 +229,7 @@ class BrokerMW ():
       elif (disc_resp.msg_type == discovery_pb2.TYPE_ISREADY):
         # received a response to our isready request
         timeout = self.upcall_obj.handle_isready_response (disc_resp.isready_resp)
-      elif (disc_resp.msg_type == discovery_pb2.TYPE_LOOKUP_ALL_PUBS):
+      elif (disc_resp.msg_type == discovery_pb2.TYPE_LOOKUP_ALL_PUBS or disc_resp.msg_type == discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC):
         # received a response to our lookup request
         timeout = self.upcall_obj.handle_allpub_lookup_response(disc_resp.lookup_resp)
 
@@ -272,7 +272,7 @@ class BrokerMW ():
   # No return value from this as it is handled in the invoke_operation
   # method of the application object.
   ########################################
-  def send_register_request (self, name):
+  def send_register_request (self, name, group):
     ''' register the appln with the discovery service '''
 
     try:
@@ -290,6 +290,7 @@ class BrokerMW ():
       reg_info.id = name  # our id
       reg_info.addr = self.addr  # our advertised IP addr where we are publishing
       reg_info.port = self.port # port on which we are publishing
+      reg_info.group = group # Group we are assigned to
       self.logger.debug ("BrokerMW::register - done populating the Registrant Info")
       
       # Next build a RegisterReq message
@@ -424,6 +425,52 @@ class BrokerMW ():
       raise e
     
 
+
+  ########################################
+  # send lookup request to get info about 
+  # publishers we need to connect to
+  ########################################
+  def send_lookup_request (self, topiclist):
+    ''' send_lookup_request '''
+
+    try:
+      self.logger.debug ("BrokerMW::lookup")
+
+      
+      # Next build a RegisterReq message
+      self.logger.debug ("BrokerMW::lookup - populate the nested register req")
+      lookup_req = discovery_pb2.LookupPubByTopicReq ()  # allocate 
+      lookup_req.topiclist[:] = topiclist   # this is how repeated entries are added (or use append() or extend ()
+      lookup_req.requester = 'Broker'
+      self.logger.debug ("BrokerMW::lookup - done populating nested RegisterReq")
+
+      # Finally, build the outer layer DiscoveryReq Message
+      self.logger.debug ("BrokerMW::lookup - build the outer DiscoveryReq message")
+      disc_req = discovery_pb2.DiscoveryReq ()  # allocate
+      disc_req.msg_type = discovery_pb2.TYPE_LOOKUP_PUB_BY_TOPIC  # set message type
+      # It was observed that we cannot directly assign the nested field here.
+      # A way around is to use the CopyFrom method as shown
+      disc_req.lookup_req.CopyFrom (lookup_req)
+      # disc_req.timestamp_sent = str(time.time())
+      self.logger.debug ("BrokerMW::lookup - done building the outer message")
+      
+      # now let us stringify the buffer and print it. This is actually a sequence of bytes and not
+      # a real string
+      buf2send = disc_req.SerializeToString ()
+      self.logger.debug ("Stringified serialized buf = {}".format (buf2send))
+
+      # now send this to our discovery service
+      self.logger.debug ("BrokerMW::lookup - send stringified buffer to Discovery service")
+      self.req.send (buf2send)  # we use the "send" method of ZMQ that sends the bytes
+
+      # now go to our event loop to receive a response to this request
+      self.logger.debug ("BrokerMW::lookup - sent lookup message and now wait for reply")
+    
+    except Exception as e:
+      raise e
+  
+
+
   ########################################
   # connect_to_publishers
   ########################################
@@ -517,7 +564,8 @@ class BrokerMW ():
       self.logger.info("Processing a SUB update")
       # A new publisher has joined
       if (data_dict['update_type'] == 'pub'):
-        # Subscribe to it only if using direct dissemination approach
+        # Subscribe if it is publishing on the topics we are interested in
+        if(self.list1_contains_an_element_from_list2(data_dict['topics'], self.upcall_obj.topics_assigned)):
           self.connect_to_publishers([ipport])
 
     # Broker or pub has died
@@ -531,3 +579,13 @@ class BrokerMW ():
 
     return
   
+  ########################################
+  # list1_contains_an_element_from_list2
+  #
+  # Returns true if list1 contains any elements from list 2
+  ########################################
+  def list1_contains_an_element_from_list2(self, list1, list2):
+    for item in list2:
+      if item in list1:
+        return True
+    return False

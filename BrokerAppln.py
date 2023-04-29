@@ -82,6 +82,10 @@ class BrokerAppln ():
     self.port = None
     self.zk_am_broker_leader = False
 
+    # Load-balancing-related variables
+    self.group = None
+    self.topics_assigned = None
+
   ########################################
   # configure/initialize
   ########################################
@@ -115,7 +119,12 @@ class BrokerAppln ():
       self.mw_obj.set_upcall_handle (self)
       self.mw_obj.configure (args) # pass remainder of the args to the m/w object
 
-      # Connect to Zookeeper to establish connection with Primary Discovery
+      # Get the group and the topics the broker is assigned to
+      self.group = args.group
+      self.topics_assigned = config['GroupToTopicMapping'][self.group].split(',')
+
+
+      # Connect to Zookeeper to establish connection with Primary Discovery and do broker leader election within the group
       if(self.lookup == 'ZooKeeper'):
         self.zookeeper_addr = args.zookeeper
         self.zk_client = KazooClient(hosts=self.zookeeper_addr)
@@ -149,9 +158,9 @@ class BrokerAppln ():
     # Start a children watch on /discovery
     @self.zk_client.ChildrenWatch('/brokers')
     def watch_discovery_children(children):
-      if(len(children) == 0):
+      if(self.zk_client.exists('/brokers/' + self.group) == None):
         # if we get triggered, this means a discovery node has died, so we need to elect a new discovery leader and subscribe to it if we are not the leader
-        self.zk_am_broker_leader = self.register_broker_with_zookeeper()
+        self.zk_am_broker_leader = self.register_broker_with_zookeeper()        
 
     return
   
@@ -160,7 +169,7 @@ class BrokerAppln ():
   # register_broker_with_zookeeper
   ########################################
   def register_broker_with_zookeeper(self):
-    path = '/brokers/leader'
+    path = '/brokers/' + self.group 
 
     # Create an ephemeral node for Discovery leader
     try:
@@ -174,12 +183,12 @@ class BrokerAppln ():
 
       # Try to create the ephemeral node
       self.zk_client.create(path, ephemeral=True, makepath=True, value=data_bytes)
-      self.logger.info ("Ephemeral /discovery/leader successfully created, we are a leader")
+      self.logger.info (f"Ephemeral {path} node successfully created, we are a leader")
       return True
     
     except NodeExistsError:
       # Handle the case where the node already exists
-      self.logger.info ("Ephemeral /discovery/leader node already exists, we are NOT a leader")
+      self.logger.info (f"Ephemeral {path} node already exists, we are NOT a leader")
 
       return False
 
@@ -321,7 +330,7 @@ class BrokerAppln ():
       if (self.state == self.State.REGISTER):
         # send a register msg to discovery service
         self.logger.debug ("BrokerAppln::invoke_operation - register with the discovery service")
-        self.mw_obj.send_register_request (self.name)
+        self.mw_obj.send_register_request (self.name, self.group)
 
         # Remember that we were invoked by the event loop as part of the upcall.
         # So we are going to return back to it for its next iteration. Because
@@ -352,7 +361,8 @@ class BrokerAppln ():
 
         # Send the lookup request to receive info about all publishers
         # we will need to subscribe to all of them
-        self.mw_obj.send_allpub_lookup_request()
+        # self.mw_obj.send_allpub_lookup_request()
+        self.mw_obj.send_lookup_request(self.topics_assigned)
 
         # Block until we receive the lookup response
         return None
@@ -515,6 +525,9 @@ def parseCmdLineArgs ():
 
   # address of Zookeeper
   parser.add_argument("-z", "--zookeeper", default='localhost:2181', help="Address of the Zookeeper instance")
+
+  # group assignment for load balancing
+  parser.add_argument("-g", "--group", choices=['group1', 'group2', 'group3'], help="What group the broker is assigned to")
   
   return parser.parse_args()
 
